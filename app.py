@@ -515,5 +515,199 @@ def fmt_b(val):
     if abs(v) >= 1e3: return f"${v/1e3:.1f}K"
     return f"${v:.2f}"
 
-def display_results(df, regime, signal, flip_str),
+def display_results(df, regime, signal, flip_str,
+                    spot_actual, date_str, et_label):
+    st.subheader(f"Snapshot — {date_str}  |  {et_label}")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Regime",           regime)
+    c2.metric("Signal",           signal)
+    c3.metric("Gamma Flip Level", flip_str)
+    c4.metric("Spot at Snapshot", f"{spot_actual:.2f}" if spot_actual else "N/A")
+
+    st.divider()
+
+    # ── GEX table ────────────────────────────────────────────
+    st.subheader("GEX Per Strike")
+    gex_dollar = ["strike"] + [c for c in df.columns if c.startswith("GEX") and c.endswith("_$")]
+    gex_roc    = [c for c in df.columns if c.startswith("GEX") and c.endswith("roc%")]
+    gex_df     = df[[*gex_dollar, *gex_roc, "_flip"]].copy()
+
+    rename_map = {}
+    for c in gex_df.columns:
+        if c.endswith("_$"):    rename_map[c] = c.replace("_$", " ($)")
+        elif c.endswith("roc%"): rename_map[c] = c.replace("_roc%", " RoC%")
+        elif c == "_flip":      rename_map[c] = "Flip"
+    gex_df.rename(columns=rename_map, inplace=True)
+
+    for c in gex_df.columns:
+        if "($)" in c: gex_df[c] = gex_df[c].apply(fmt_b)
+
+    def hl_flip(row):
+        flag = row.get("Flip", False)
+        return ["background-color:#fef08a;color:#000"] * len(row) if flag else [""]*len(row)
+
+    st.dataframe(gex_df.style.apply(hl_flip, axis=1),
+                 use_container_width=True, hide_index=True)
+
+    # ── DEX table ────────────────────────────────────────────
+    st.subheader("DEX Per Strike")
+    dex_dollar = ["strike"] + [c for c in df.columns if c.startswith("DEX") and c.endswith("_$")]
+    dex_roc    = [c for c in df.columns if c.startswith("DEX") and c.endswith("roc%")]
+    dex_df     = df[[*dex_dollar, *dex_roc]].copy()
+
+    rename_dex = {}
+    for c in dex_df.columns:
+        if c.endswith("_$"):    rename_dex[c] = c.replace("_$", " ($)")
+        elif c.endswith("roc%"): rename_dex[c] = c.replace("_roc%", " RoC%")
+    dex_df.rename(columns=rename_dex, inplace=True)
+
+    for c in dex_df.columns:
+        if "($)" in c: dex_df[c] = dex_df[c].apply(fmt_b)
+
+    st.dataframe(dex_df, use_container_width=True, hide_index=True)
+
+    # ── Raw Greeks ───────────────────────────────────────────
+    with st.expander("Raw Greeks + OI + Volume"):
+        raw_cols = ["strike","spot_used",
+                    "call_iv","call_delta","call_gamma","call_vanna","call_charm",
+                    "call_oi","call_volume",
+                    "put_iv","put_delta","put_gamma","put_vanna","put_charm",
+                    "put_oi","put_volume"]
+        raw_df = df[[c for c in raw_cols if c in df.columns]].copy()
+        st.dataframe(raw_df, use_container_width=True, hide_index=True)
+
+    # ── Full time series ─────────────────────────────────────
+    if "full_series" in st.session_state:
+        with st.expander("Full intraday time series"):
+            fs = st.session_state["full_series"]
+            ts_cols = (["timestamp","strike"] +
+                       [c for c in fs.columns
+                        if c not in ["timestamp","strike","_optType","_dte_years"]])
+            st.dataframe(
+                fs[[c for c in ts_cols if c in fs.columns]],
+                use_container_width=True, hide_index=True
+            )
+
+# ─────────────────────────────────────────────────────────────
+# INPUT FORM — main page (no sidebar)
+# ─────────────────────────────────────────────────────────────
+st.header("Parameters")
+
+with st.form("params_form"):
+    r1c1, r1c2 = st.columns(2)
+    api_key       = r1c1.text_input("iVolatility API Key", type="password",
+                                     placeholder="Paste your Backtest+ key")
+    minute_type   = r1c2.selectbox("Bar Interval",
+                                    ["MINUTE_30","MINUTE_15","MINUTE_5","MINUTE_1"])
+
+    r2c1, r2c2 = st.columns(2)
+    date_input    = r2c1.date_input("Date (EAT)", value=date.today())
+    time_input    = r2c2.time_input("Session Time (EAT)",
+                                     value=time(17, 30))   # 17:30 EAT = 09:30 ET
+
+    r3c1, r3c2, r3c3 = st.columns(3)
+    center_strike = r3c1.number_input("Center Strike", value=5580, step=5)
+    num_strikes   = r3c2.number_input("Strikes Each Side", value=5,
+                                       min_value=1, max_value=20, step=1)
+    strike_step   = r3c3.number_input("Strike Step", value=5,
+                                       min_value=1, step=1)
+
+    spot_override = st.number_input(
+        "Spot Override — used only if API underlyingPrice is missing",
+        value=float(center_strike), step=1.0
+    )
+
+    submitted = st.form_submit_button("🚀 Fetch & Calculate", use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────
+# MAIN PIPELINE
+# ─────────────────────────────────────────────────────────────
+if submitted:
+    if not api_key:
+        st.error("Enter your iVolatility API key"); st.stop()
+
+    date_str      = date_input.strftime("%Y-%m-%d")
+    prev_date_str = prev_trading_day(date_input).strftime("%Y-%m-%d")
+    exp_date_str  = date_str   # 0DTE
+    et_dt, tz_str = eat_to_et(date_input, time_input)
+    et_label      = f"{et_dt.strftime('%H:%M')} {tz_str}"
+
+    strike_min = int(center_strike) - int(num_strikes) * int(strike_step)
+    strike_max = int(center_strike) + int(num_strikes) * int(strike_step)
+    headers    = {"Authorization": f"Bearer {api_key}"}
+
+    st.info(
+        f"Date: {date_str}  |  OI source: {prev_date_str}  |  "
+        f"Snapshot: {et_label}  |  Strikes: {strike_min}–{strike_max} "
+        f"step {int(strike_step)}"
+    )
+
+    # ── Step 1 ───────────────────────────────────────────────
+    with st.spinner("Step 1 / 3 — Fetching option series..."):
+        calls_series, puts_series = get_option_ids(
+            api_key, headers, prev_date_str,
+            exp_date_str, strike_min, strike_max
+        )
+    if calls_series is None: st.stop()
+    st.success(f"Step 1 ✅ — Calls: {len(calls_series)}  Puts: {len(puts_series)}")
+
+    # ── Step 2 ───────────────────────────────────────────────
+    with st.spinner("Step 2 / 3 — Fetching EOD OI from previous close..."):
+        oi_map = get_eod_oi(api_key, headers, calls_series,
+                            puts_series, prev_date_str)
+    filled = sum(1 for v in oi_map.values() if v > 0)
+    st.success(f"Step 2 ✅ — OI entries: {filled}/{len(oi_map)} non-zero")
+
+    # ── Step 3 ───────────────────────────────────────────────
+    st.write("Step 3 / 3 — Fetching intraday Greeks...")
+    progress = st.progress(0, text="Starting...")
+    df_all = get_intraday_greeks(
+        api_key, date_str, exp_date_str,
+        strike_min, strike_max, strike_step,
+        minute_type, oi_map, progress
+    )
+    progress.empty()
+    if df_all is None:
+        st.error("No intraday data returned"); st.stop()
+    st.success(f"Step 3 ✅ — {len(df_all):,} intraday rows after session filter")
+
+    # ── Pivot + snapshot ─────────────────────────────────────
+    intra_date     = date_input
+    target_et_full = datetime.combine(intra_date, et_dt.time())
+
+    snap, open_snap, full_series = pivot_and_snapshot(df_all, target_et_full, intra_date)
+    st.session_state["full_series"] = full_series
+
+    if snap.empty:
+        st.error("No bars at or before the requested time — try a later EAT time")
+        st.stop()
+
+    # DTE fractions
+    sess_open  = datetime.combine(intra_date, time(9, 30))
+    sess_close = datetime.combine(intra_date, time(16, 0))
+    total_mins = (sess_close - sess_open).seconds / 60
+    rem_mins   = max((sess_close - target_et_full).seconds / 60, 0)
+
+    snap["_dte_frac"]      = rem_mins   / total_mins
+    open_snap["_dte_frac"] = 1.0
+
+    # ── Formulas ─────────────────────────────────────────────
+    snap_calc,  flip_strikes = calculate_formulas(snap,      spot_override)
+    open_calc,  _            = calculate_formulas(open_snap, spot_override)
+
+    # ── Rate of change ───────────────────────────────────────
+    snap_final = rate_of_change(snap_calc, open_calc)
+
+    # ── Regime ───────────────────────────────────────────────
+    regime, signal, flip_str, _ = interpret_regime(snap_final, flip_strikes)
+
+    # ── Spot from API ────────────────────────────────────────
+    spot_actual = (snap_final["spot_used"].median()
+                   if "spot_used" in snap_final.columns else spot_override)
+
+    # ── Render ───────────────────────────────────────────────
+    display_results(snap_final, regime, signal, flip_str,
+                    spot_actual, date_str, et_label)
+                    
          
