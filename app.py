@@ -515,5 +515,5 @@ def fmt_b(val):
     if abs(v) >= 1e3: return f"${v/1e3:.1f}K"
     return f"${v:.2f}"
 
-def display_results(df, regime, signal, flip_str,
+def display_results(df, regime, signal, flip_str,)
          
