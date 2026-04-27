@@ -1,96 +1,127 @@
 # ─────────────────────────────────────────────────────────────
-# SPX GEX / DEX Multi-Formula Analyzer
-# Streamlit app — paste into app.py
-# pip install streamlit requests pandas streamlit-lightweight-charts
+# SPX GEX / DEX Multi-Formula Analyzer — Streamlit App
+# pip install streamlit requests pandas scipy ivolatility
 # ─────────────────────────────────────────────────────────────
 
 import streamlit as st
 import requests
 import pandas as pd
+import numpy as np
+import ivolatility as ivol
 import gzip
 import io
-import time
+import time as time_module
+from datetime import datetime, timedelta, time, date
+from scipy.stats import norm
 
 st.set_page_config(page_title="SPX GEX/DEX Analyzer", layout="wide")
 st.title("SPX GEX / DEX Multi-Formula Analyzer")
 
 # ─────────────────────────────────────────────────────────────
-# SIDEBAR — INPUTS
+# CONSTANTS
 # ─────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.header("Parameters")
-    api_key       = st.text_input("iVolatility API Key", type="password")
-    date_input    = st.date_input("Date (EAT)")
-    time_input    = st.time_input("Session Time (EAT)")
-    center_strike = st.number_input("Center Strike", value=5580, step=5)
-    num_strikes   = st.number_input("Strikes Each Side", value=5, min_value=1, max_value=20, step=1)
-    run_btn       = st.button("Fetch & Calculate", type="primary")
+BASE_URL    = "https://restapi.ivolatility.com"
+RATE_LIMIT  = 1.2
+POLL_DELAY  = 2.0
+SPX_MULT    = 100
+RISK_FREE   = 0.0525
+SESSION_START = time(9, 30)
+SESSION_END   = time(16, 0)
 
-# EAT → ET label (EAT = UTC+3, ET = UTC-5 standard / UTC-4 DST)
-# We just show the converted label — API is date-based only
-from datetime import datetime, timedelta
-def eat_to_et_label(d, t):
+# ─────────────────────────────────────────────────────────────
+# TIMEZONE — EAT to ET
+# EAT = UTC+3, EST = UTC-5 → EAT is 8h ahead of EST
+# EDT = UTC-4 → EAT is 7h ahead of EDT
+# US markets observe EDT Mar-Nov, EST Nov-Mar
+# ─────────────────────────────────────────────────────────────
+def eat_to_et(d, t):
     eat_dt = datetime.combine(d, t)
-    et_dt  = eat_dt - timedelta(hours=8)   # EAT is +8h ahead of ET (EST)
-    return et_dt.strftime("%Y-%m-%d %H:%M ET")
+    # Rough DST: EDT Mar 2nd Sun – Nov 1st Sun
+    month = d.month
+    is_edt = 3 <= month <= 10
+    offset = timedelta(hours=7 if is_edt else 8)
+    et_dt  = eat_dt - offset
+    tz_str = "EDT" if is_edt else "EST"
+    return et_dt, tz_str
+
+def prev_trading_day(d):
+    step = 3 if d.weekday() == 0 else 1
+    return d - timedelta(days=step)
 
 # ─────────────────────────────────────────────────────────────
-# API HELPERS (from your working notebook)
+# BSM VANNA & CHARM
 # ─────────────────────────────────────────────────────────────
-BASE_URL = "https://restapi.ivolatility.com"
-DELAY      = 1.2
-POLL_DELAY = 2.0
+def _d1d2(S, K, T, r, sigma):
+    if T <= 1e-8 or sigma <= 0 or S <= 0 or K <= 0:
+        return np.nan, np.nan
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    return d1, d1 - sigma * np.sqrt(T)
 
-def find_url_key(obj, key, depth=0):
+def bsm_vanna(S, K, T, r, sigma):
+    d1, d2 = _d1d2(S, K, T, r, sigma)
+    if np.isnan(d1): return np.nan
+    return -norm.pdf(d1) * d2 / sigma
+
+def bsm_charm(S, K, T, r, sigma):
+    d1, d2 = _d1d2(S, K, T, r, sigma)
+    if np.isnan(d1) or T <= 1e-8: return np.nan
+    return -norm.pdf(d1) * (2*r*T - d2*sigma*np.sqrt(T)) / (2*T*sigma*np.sqrt(T))
+
+# ─────────────────────────────────────────────────────────────
+# API HELPERS
+# ─────────────────────────────────────────────────────────────
+def find_download_url(obj, depth=0):
     if depth > 10: return None
     if isinstance(obj, dict):
-        if key in obj and obj[key]: return obj[key]
+        if "urlForDownload" in obj: return obj["urlForDownload"]
         for v in obj.values():
-            found = find_url_key(v, key, depth+1)
-            if found: return found
+            f = find_download_url(v, depth+1)
+            if f: return f
     elif isinstance(obj, list):
         for item in obj:
-            found = find_url_key(item, key, depth+1)
-            if found: return found
+            f = find_download_url(item, depth+1)
+            if f: return f
     return None
 
-def call_async_download(endpoint, params, label="", max_polls=20):
-    time.sleep(DELAY)
-    r = requests.get(f"{BASE_URL}{endpoint}", headers={"Authorization": f"Bearer {params['apiKey']}"}, params=params)
+def find_poll_url(obj, depth=0):
+    if depth > 10: return None
+    if isinstance(obj, dict):
+        if "urlForDetails" in obj and obj["urlForDetails"]: return obj["urlForDetails"]
+        for v in obj.values():
+            f = find_poll_url(v, depth+1)
+            if f: return f
+    elif isinstance(obj, list):
+        for item in obj:
+            f = find_poll_url(item, depth+1)
+            if f: return f
+    return None
+
+def async_download(endpoint, params, headers, label="", max_polls=20):
+    time_module.sleep(RATE_LIMIT)
+    r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
     if r.status_code != 200:
         st.error(f"[{label}] HTTP {r.status_code}: {r.text[:200]}")
         return None
     body = r.json()
-    url  = find_url_key(body, "urlForDownload")
+    url  = find_download_url(body)
     if url: return url
-    poll_url = find_url_key(body, "urlForDetails")
+    poll_url = find_poll_url(body)
     if not poll_url:
-        st.error(f"[{label}] No poll URL found")
+        st.error(f"[{label}] No poll URL")
         return None
-    for attempt in range(1, max_polls + 1):
-        time.sleep(POLL_DELAY)
-        rp = requests.get(poll_url, headers={"Authorization": f"Bearer {params['apiKey']}"}, params={"apiKey": params["apiKey"]})
-        if rp.status_code == 429: time.sleep(3); continue
+    for attempt in range(1, max_polls+1):
+        time_module.sleep(POLL_DELAY)
+        rp = requests.get(poll_url, headers=headers, params={"apiKey": params["apiKey"]})
+        if rp.status_code == 429: time_module.sleep(3); continue
         if rp.status_code != 200: continue
-        url = find_url_key(rp.json(), "urlForDownload")
+        url = find_download_url(rp.json())
         if url: return url
     st.error(f"[{label}] Polling timed out")
     return None
 
-def call_sync(endpoint, params, label=""):
-    time.sleep(DELAY)
-    r = requests.get(f"{BASE_URL}{endpoint}", headers={"Authorization": f"Bearer {params['apiKey']}"}, params=params)
-    if r.status_code == 429:
-        time.sleep(3)
-        r = requests.get(f"{BASE_URL}{endpoint}", headers={"Authorization": f"Bearer {params['apiKey']}"}, params=params)
-    if r.status_code != 200: return None
-    body    = r.json()
-    records = body.get("data", []) if isinstance(body, dict) else body
-    return records if records else None
-
-def download_csv_gz(url, api_key, label=""):
-    time.sleep(DELAY)
-    r = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, params={"apiKey": api_key})
+def download_csv_gz(url, headers, api_key, label=""):
+    time_module.sleep(RATE_LIMIT)
+    r = requests.get(url, headers=headers, params={"apiKey": api_key})
     if r.status_code != 200: return None
     try:
         with gzip.open(io.BytesIO(r.content), "rt") as f:
@@ -102,354 +133,368 @@ def download_csv_gz(url, api_key, label=""):
             st.error(f"CSV parse error: {e}")
             return None
 
-# ─────────────────────────────────────────────────────────────
-# FETCH PIPELINE
-# ─────────────────────────────────────────────────────────────
-def fetch_spx_data(api_key, target_date, center_strike, num_strikes):
-    target_str = target_date.strftime("%Y-%m-%d")
+def sync_call(endpoint, params, headers, label=""):
+    time_module.sleep(RATE_LIMIT)
+    r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
+    if r.status_code == 429:
+        time_module.sleep(3)
+        r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
+    if r.status_code != 200: return None
+    body    = r.json()
+    records = body.get("data", []) if isinstance(body, dict) else body
+    return records if records else None
 
-    # Step 1 — option series
-    with st.spinner("Fetching option series..."):
-        dl_url = call_async_download(
-            "/equities/eod/option-series-on-date",
-            {"symbol": "SPX", "date": target_str, "apiKey": api_key},
-            label="series"
-        )
-    if not dl_url:
-        st.error("Failed to get option series")
-        return None
+# ─────────────────────────────────────────────────────────────
+# STEP 1 — Option series → optionIds
+# ─────────────────────────────────────────────────────────────
+def get_option_ids(api_key, headers, prev_date_str, exp_date_str, strike_min, strike_max):
+    dl_url = async_download(
+        "/equities/eod/option-series-on-date",
+        {"symbol": "SPX", "date": prev_date_str, "apiKey": api_key},
+        headers, label="series"
+    )
+    if not dl_url: return None, None
 
-    series_df = download_csv_gz(dl_url, api_key, label="series")
+    series_df = download_csv_gz(dl_url, headers, api_key, label="series")
     if series_df is None or series_df.empty:
-        st.error("Empty option series")
-        return None
+        st.error("Empty option series"); return None, None
 
-    series_df.columns = [c.strip().lower() for c in series_df.columns]
+    series_df.columns      = [c.strip().lower() for c in series_df.columns]
     series_df["expirationdate"] = pd.to_datetime(series_df["expirationdate"])
     series_df["strike"]         = pd.to_numeric(series_df["strike"], errors="coerce")
 
-    # Nearest expiry on or after target date
-    target_dt   = pd.Timestamp(target_str)
-    future_exps = series_df[series_df["expirationdate"] >= target_dt]["expirationdate"].sort_values().unique()
-    if len(future_exps) == 0:
-        st.error("No valid expiries found")
-        return None
-    chosen     = future_exps[0]
-    chosen_str = chosen.strftime("%Y-%m-%d")
-    st.info(f"Using expiry: {chosen_str}")
+    exp_target  = pd.Timestamp(exp_date_str)
+    exp_mask    = series_df["expirationdate"] == exp_target
+    strike_mask = (series_df["strike"] >= strike_min) & (series_df["strike"] <= strike_max)
+    filtered    = series_df[exp_mask & strike_mask].copy()
 
-    # Strike selection — 5 each side
-    exp_mask       = series_df["expirationdate"] == chosen
-    strikes_avail  = sorted(series_df[exp_mask]["strike"].dropna().unique())
-    below          = [s for s in strikes_avail if s <= center_strike][-num_strikes:]
-    above          = [s for s in strikes_avail if s >  center_strike][:num_strikes]
-    selected       = below + above
+    if filtered.empty:
+        st.error(f"No contracts found for expiry {exp_date_str} in strike range {strike_min}–{strike_max}")
+        return None, None
 
-    filtered = series_df[exp_mask & series_df["strike"].isin(selected)].copy()
+    cp_col = next((c for c in filtered.columns if c in ["callput","call_put","type","optiontype"]), None)
+    if not cp_col:
+        st.error("Cannot identify call/put column"); return None, None
+
     filtered["_is_spx"] = filtered["optionsymbol"].str.strip().str.startswith("SPX ")
     filtered = filtered.sort_values("_is_spx", ascending=False)
-    filtered = filtered.drop_duplicates(subset=["strike", "callput"], keep="first")
+    filtered = filtered.drop_duplicates(subset=["strike", cp_col], keep="first")
     filtered = filtered.drop(columns=["_is_spx"]).reset_index(drop=True)
 
-    calls = filtered[filtered["callput"] == "C"].sort_values("strike")
-    puts  = filtered[filtered["callput"] == "P"].sort_values("strike")
+    calls = filtered[filtered[cp_col] == "C"].sort_values("strike")
+    puts  = filtered[filtered[cp_col] == "P"].sort_values("strike")
+    return calls, puts
 
-    # Step 2 — Greeks per contract
-    def fetch_greeks(row):
-        oid = int(row["optionid"])
-        rec = call_sync(
+# ─────────────────────────────────────────────────────────────
+# STEP 2 — EOD OI from prev day
+# ─────────────────────────────────────────────────────────────
+def get_eod_oi(api_key, headers, calls, puts, prev_date_str):
+    oi_map = {}
+
+    def fetch_oi(row, cp_label):
+        oid    = int(row["optionid"])
+        strike = float(row["strike"])
+        rec    = sync_call(
             "/equities/eod/single-stock-option-raw-iv",
-            {"optionId": oid, "from": target_str, "to": target_str, "apiKey": api_key},
-            label=f"{row['callput']}{int(row['strike'])}"
+            {"optionId": oid, "from": prev_date_str, "to": prev_date_str, "apiKey": api_key},
+            headers, label=f"{cp_label}{int(strike)}"
         )
-        if rec:
-            d = rec[0]
-            d["_strike"] = row["strike"]
-            d["_cp"]     = row["callput"]
-            return d
-        return None
+        if not rec: return
+        d = {k.strip().lower().replace(" ", ""): v for k, v in rec[0].items()}
+        oi_val = (
+            d.get("openinterest") or d.get("open_interest") or
+            d.get("oi") or d.get("openint") or 0
+        )
+        oi_map[(strike, cp_label)] = int(float(oi_val)) if oi_val else 0
 
-    with st.spinner("Fetching Greeks for calls..."):
-        call_greeks = [r for r in (fetch_greeks(row) for _, row in calls.iterrows()) if r]
-    with st.spinner("Fetching Greeks for puts..."):
-        put_greeks  = [r for r in (fetch_greeks(row) for _, row in puts.iterrows()) if r]
-
-    if not call_greeks and not put_greeks:
-        st.error("No Greeks returned")
-        return None
-
-    def to_df(rows, prefix):
-        df = pd.DataFrame(rows)
-        df.columns = [c.strip().lower() for c in df.columns]
-        df["strike"] = df["_strike"]
-
-        # Normalise column names across API variants
-        for src, dst in [
-            ("open interest", "oi"), ("openinterest", "oi"), ("open_interest", "oi"),
-            ("rawiv", "iv"), ("impliedvolatility", "iv"),
-        ]:
-            if src in df.columns and "oi" not in df.columns or src in df.columns and dst not in df.columns:
-                df[dst] = df[src]
-
-        num_cols = ["iv", "delta", "gamma", "theta", "vega", "vanna", "charm", "oi"]
-        for col in num_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            else:
-                df[col] = None
-
-        df["oi"] = df["oi"].fillna(0).astype(int)
-        keep = ["strike"] + [c for c in num_cols if c in df.columns]
-        df = df[keep].copy()
-        df.columns = ["strike"] + [f"{prefix}_{c}" for c in df.columns if c != "strike"]
-        return df.sort_values("strike").reset_index(drop=True)
-
-    calls_df = to_df(call_greeks, "call") if call_greeks else pd.DataFrame()
-    puts_df  = to_df(put_greeks,  "put")  if put_greeks  else pd.DataFrame()
-
-    if not calls_df.empty and not puts_df.empty:
-        merged = calls_df.merge(puts_df, on="strike", how="outer").sort_values("strike")
-    elif not calls_df.empty:
-        merged = calls_df
-    else:
-        merged = puts_df
-
-    merged["strike"] = merged["strike"].astype(int)
-    merged["expiry"] = chosen_str
-    return merged
+    for _, row in calls.iterrows(): fetch_oi(row, "C")
+    for _, row in puts.iterrows():  fetch_oi(row, "P")
+    return oi_map
 
 # ─────────────────────────────────────────────────────────────
-# GEX / DEX FORMULA ENGINE
+# STEP 3 — Intraday Greeks
 # ─────────────────────────────────────────────────────────────
-def calculate_all(df, spot):
-    out = df.copy()
+def get_intraday_greeks(api_key, date_str, exp_date_str, strike_min, strike_max,
+                        strike_step, minute_type, oi_map, progress_bar):
+    ivol.setLoginParams(apiKey=api_key)
+    get_intra = ivol.setMethod("/equities/intraday/single-equity-option-rawiv")
 
-    cg  = out.get("call_gamma",  pd.Series([0.0]*len(out))).fillna(0)
-    pg  = out.get("put_gamma",   pd.Series([0.0]*len(out))).fillna(0)
-    coi = out.get("call_oi",     pd.Series([0.0]*len(out))).fillna(0)
-    poi = out.get("put_oi",      pd.Series([0.0]*len(out))).fillna(0)
-    cd  = out.get("call_delta",  pd.Series([0.0]*len(out))).fillna(0)
-    pd_ = out.get("put_delta",   pd.Series([0.0]*len(out))).fillna(0)
+    strikes   = list(range(int(strike_min), int(strike_max) + int(strike_step), int(strike_step)))
+    opt_types = ["C", "P"]
+    total     = len(strikes) * len(opt_types)
+    all_data  = []
+    count     = 0
 
-    scale_gex = 100 * spot**2
-    scale_dex = 100 * spot
-
-    # ── GEX Variants ────────────────────────────────────────
-    # GEX-1: Standard (dealers short all)
-    out["GEX1_per_strike"]    = (cg*coi - pg*poi) * scale_gex
-    out["GEX1_$_per_strike"]  = out["GEX1_per_strike"] * spot
-
-    # GEX-2: Sign-corrected (dealers long puts)
-    out["GEX2_per_strike"]    = (cg*coi + pg*poi) * scale_gex
-    out["GEX2_$_per_strike"]  = out["GEX2_per_strike"] * spot
-
-    # GEX-3: OI-skew weighted
-    total_oi = coi + poi
-    skew     = (coi / total_oi.replace(0, float("nan"))).fillna(0.5)
-    out["GEX3_per_strike"]    = (cg*coi - skew*pg*poi) * scale_gex
-    out["GEX3_$_per_strike"]  = out["GEX3_per_strike"] * spot
-
-    # ── DEX Variants ────────────────────────────────────────
-    # DEX-1: Standard
-    out["DEX1_per_strike"]    = (cd*coi - pd_*poi) * scale_dex
-    out["DEX1_$_per_strike"]  = out["DEX1_per_strike"] * spot
-
-    # DEX-2: Charm-adjusted (0DTE) — only if charm columns exist
-    has_charm = "call_charm" in out.columns and "put_charm" in out.columns
-    if has_charm:
-        cc = out["call_charm"].fillna(0)
-        pc = out["put_charm"].fillna(0)
-        # Assume 390 minutes in full session; charm decays delta over time
-        # Using 390 as denominator — adjust minutes_to_expiry manually if needed
-        minutes_to_expiry = 390
-        charm_flow = (cc*coi - pc*poi) * 100 * (minutes_to_expiry / 390)
-        out["DEX2_charm_adj_per_strike"]   = out["DEX1_per_strike"] - charm_flow * spot
-        out["DEX2_charm_adj_$_per_strike"] = out["DEX2_charm_adj_per_strike"] * spot
-    else:
-        out["DEX2_charm_adj_per_strike"]   = None
-        out["DEX2_charm_adj_$_per_strike"] = None
-
-    # DEX-3: Vanna-adjusted — only if vanna columns exist
-    has_vanna = "call_vanna" in out.columns and "put_vanna" in out.columns
-    if has_vanna:
-        cv = out["call_vanna"].fillna(0)
-        pv = out["put_vanna"].fillna(0)
-        # ATM IV proxy — use mean of call IVs as ATM reference
-        atm_iv = out.get("call_iv", pd.Series([0.2]*len(out))).fillna(0.2).mean()
-        iv_diff_c = out.get("call_iv", pd.Series([atm_iv]*len(out))).fillna(atm_iv) - atm_iv
-        iv_diff_p = out.get("put_iv",  pd.Series([atm_iv]*len(out))).fillna(atm_iv) - atm_iv
-        vanna_flow = (cv*coi*iv_diff_c - pv*poi*iv_diff_p) * 100
-        out["DEX3_vanna_adj_per_strike"]   = out["DEX1_per_strike"] + vanna_flow * spot
-        out["DEX3_vanna_adj_$_per_strike"] = out["DEX3_vanna_adj_per_strike"] * spot
-    else:
-        out["DEX3_vanna_adj_per_strike"]   = None
-        out["DEX3_vanna_adj_$_per_strike"] = None
-
-    # ── Gamma Flip Detection ─────────────────────────────────
-    # Flip level = strike where GEX1 changes sign strike-to-strike
-    g = out["GEX1_per_strike"].values
-    flip_strikes = []
-    for i in range(1, len(g)):
-        if g[i-1] * g[i] < 0:   # sign change
-            flip_strikes.append(out["strike"].iloc[i])
-    out["_flip"] = out["strike"].isin(flip_strikes)
-
-    return out, flip_strikes, has_charm, has_vanna
-
-# ─────────────────────────────────────────────────────────────
-# REGIME INTERPRETATION
-# ─────────────────────────────────────────────────────────────
-def interpret_regime(df, flip_strikes):
-    net_gex1 = df["GEX1_per_strike"].sum()
-    net_gex2 = df["GEX2_per_strike"].sum()
-    net_dex1 = df["DEX1_per_strike"].sum()
-
-    regime   = "🔴 Negative Gamma (Trending / Volatile)" if net_gex1 < 0 else "🟢 Positive Gamma (Mean-Reverting / Pinned)"
-    dex_bias = "📈 Bullish" if net_dex1 > 0 else "📉 Bearish"
-
-    if net_gex1 < 0 and net_dex1 > 0:
-        signal = "⚡ Strong Bullish Move Signal — Negative GEX + Positive DEX"
-    elif net_gex1 < 0 and net_dex1 < 0:
-        signal = "⚡ Strong Bearish Move Signal — Negative GEX + Negative DEX"
-    elif net_gex1 > 0:
-        signal = "🔒 Pin/Fade Signal — Positive GEX regime, expect mean reversion"
-    else:
-        signal = "⚠️ Neutral — No strong directional bias"
-
-    flip_str = ", ".join(str(s) for s in flip_strikes) if flip_strikes else "None identified in this range"
-
-    return {
-        "net_gex1":   net_gex1,
-        "net_gex2":   net_gex2,
-        "net_dex1":   net_dex1,
-        "regime":     regime,
-        "dex_bias":   dex_bias,
-        "signal":     signal,
-        "flip_level": flip_str,
-    }
-
-# ─────────────────────────────────────────────────────────────
-# DISPLAY
-# ─────────────────────────────────────────────────────────────
-def format_millions(val):
-    if pd.isna(val) or val is None: return "N/A"
-    if abs(val) >= 1_000_000:
-        return f"${val/1_000_000:.2f}M"
-    elif abs(val) >= 1_000:
-        return f"${val/1_000:.1f}K"
-    return f"${val:.2f}"
-
-def display_results(df, interp, has_charm, has_vanna, date_label, et_label):
-    st.subheader(f"Results — {date_label}  ({et_label})")
-
-    # Regime panel
-    col1, col2, col3 = st.columns(3)
-    col1.metric("GEX Regime", interp["regime"])
-    col2.metric("DEX Bias",   interp["dex_bias"])
-    col3.metric("Gamma Flip Level", interp["flip_level"])
-
-    st.info(interp["signal"])
-
-    col4, col5, col6 = st.columns(3)
-    col4.metric("Net GEX-1 ($)",  format_millions(interp["net_gex1"]))
-    col5.metric("Net GEX-2 ($)",  format_millions(interp["net_gex2"]))
-    col6.metric("Net DEX-1 ($)",  format_millions(interp["net_dex1"]))
-
-    st.divider()
-
-    # ── GEX Table ────────────────────────────────────────────
-    st.subheader("GEX Per Strike")
-    gex_cols = ["strike",
-                "GEX1_per_strike", "GEX1_$_per_strike",
-                "GEX2_per_strike", "GEX2_$_per_strike",
-                "GEX3_per_strike", "GEX3_$_per_strike",
-                "_flip"]
-    gex_df = df[[c for c in gex_cols if c in df.columns]].copy()
-    gex_df.rename(columns={
-        "GEX1_per_strike":   "GEX1",
-        "GEX1_$_per_strike": "GEX1 $",
-        "GEX2_per_strike":   "GEX2",
-        "GEX2_$_per_strike": "GEX2 $",
-        "GEX3_per_strike":   "GEX3",
-        "GEX3_$_per_strike": "GEX3 $",
-        "_flip":             "Flip Zone",
-    }, inplace=True)
-
-    def highlight_flip(row):
-        if row.get("Flip Zone", False):
-            return ["background-color: #ffe066"] * len(row)
-        return [""] * len(row)
-
-    for col in ["GEX1 $", "GEX2 $", "GEX3 $"]:
-        if col in gex_df.columns:
-            gex_df[col] = gex_df[col].apply(format_millions)
-
-    st.dataframe(
-        gex_df.style.apply(highlight_flip, axis=1),
-        use_container_width=True, hide_index=True
+    close_dt  = datetime(
+        int(date_str[:4]), int(date_str[5:7]), int(date_str[8:10]), 16, 0
     )
 
-    # ── DEX Table ────────────────────────────────────────────
-    st.subheader("DEX Per Strike")
-    dex_cols = ["strike",
-                "DEX1_per_strike", "DEX1_$_per_strike"]
-    if has_charm:
-        dex_cols += ["DEX2_charm_adj_per_strike", "DEX2_charm_adj_$_per_strike"]
-    if has_vanna:
-        dex_cols += ["DEX3_vanna_adj_per_strike", "DEX3_vanna_adj_$_per_strike"]
+    for strike in strikes:
+        for opt_type in opt_types:
+            count += 1
+            progress_bar.progress(count / total, text=f"Fetching {strike}{opt_type} ({count}/{total})")
+            try:
+                df = get_intra(
+                    symbol="SPX", date=date_str, expDate=exp_date_str,
+                    strike=str(strike), optType=opt_type, minuteType=minute_type
+                )
+                if df is None or len(df) == 0:
+                    time_module.sleep(RATE_LIMIT); continue
 
-    dex_df = df[[c for c in dex_cols if c in df.columns]].copy()
-    dex_df.rename(columns={
-        "DEX1_per_strike":               "DEX1",
-        "DEX1_$_per_strike":             "DEX1 $",
-        "DEX2_charm_adj_per_strike":     "DEX2 Charm",
-        "DEX2_charm_adj_$_per_strike":   "DEX2 Charm $",
-        "DEX3_vanna_adj_per_strike":     "DEX3 Vanna",
-        "DEX3_vanna_adj_$_per_strike":   "DEX3 Vanna $",
-    }, inplace=True)
+                df = df.copy()
+                df["_strike"]  = strike
+                df["_optType"] = opt_type
 
-    for col in ["DEX1 $", "DEX2 Charm $", "DEX3 Vanna $"]:
-        if col in dex_df.columns:
-            dex_df[col] = dex_df[col].apply(lambda x: format_millions(x) if x is not None else "N/A")
+                # Filter bad IV rows — IV=-1 means Greeks not calculated
+                if "optionIv" in df.columns:
+                    df["optionIv"] = pd.to_numeric(df["optionIv"], errors="coerce")
+                    df = df[df["optionIv"].notna() & (df["optionIv"] > 0) & (df["optionIv"] != -1)].copy()
 
-    st.dataframe(dex_df, use_container_width=True, hide_index=True)
+                if len(df) == 0:
+                    time_module.sleep(RATE_LIMIT); continue
 
-    # ── Raw Greeks ───────────────────────────────────────────
-    with st.expander("Raw Greeks"):
-        raw_cols = ["strike", "call_iv", "call_delta", "call_gamma", "call_theta",
-                    "call_vega", "call_oi", "put_iv", "put_delta", "put_gamma",
-                    "put_theta", "put_vega", "put_oi"]
-        if has_charm:
-            raw_cols += ["call_charm", "put_charm"]
-        if has_vanna:
-            raw_cols += ["call_vanna", "put_vanna"]
-        raw_df = df[[c for c in raw_cols if c in df.columns]].copy()
-        st.dataframe(raw_df, use_container_width=True, hide_index=True)
+                # Stamp EOD OI
+                df["optionOI"] = df.apply(
+                    lambda r: oi_map.get((float(r["_strike"]), r["_optType"]), np.nan), axis=1
+                )
+
+                # DTE in years from each timestamp to session close
+                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                df["_dte_years"] = df["timestamp"].apply(
+                    lambda ts: max(
+                        (close_dt - ts.to_pydatetime()).total_seconds() / (252 * 6.5 * 3600),
+                        1e-8
+                    )
+                )
+
+                # BSM Vanna & Charm
+                df["optionVanna"] = df.apply(
+                    lambda r: bsm_vanna(
+                        r.get("underlyingPrice", np.nan), r["_strike"],
+                        r["_dte_years"], RISK_FREE, r.get("optionIv", np.nan)
+                    ), axis=1
+                )
+                df["optionCharm"] = df.apply(
+                    lambda r: bsm_charm(
+                        r.get("underlyingPrice", np.nan), r["_strike"],
+                        r["_dte_years"], RISK_FREE, r.get("optionIv", np.nan)
+                    ), axis=1
+                )
+
+                all_data.append(df)
+            except Exception as e:
+                st.warning(f"Error {strike}{opt_type}: {e}")
+
+            time_module.sleep(RATE_LIMIT)
+
+    if not all_data: return None
+
+    combined = pd.concat(all_data, ignore_index=True)
+    combined["timestamp"] = pd.to_datetime(combined["timestamp"])
+
+    return combined[
+        (combined["timestamp"].dt.time >= SESSION_START) &
+        (combined["timestamp"].dt.time <= SESSION_END)
+    ].copy()
 
 # ─────────────────────────────────────────────────────────────
-# MAIN RUN
+# STEP 4 — Pivot wide + select snapshot at requested time
 # ─────────────────────────────────────────────────────────────
-if run_btn:
-    if not api_key:
-        st.error("Enter your iVolatility API key in the sidebar")
-        st.stop()
+COL_MAP = {
+    "optionDelta":    "delta",
+    "optionGamma":    "gamma",
+    "optionIv":       "iv",
+    "optionVanna":    "vanna",
+    "optionCharm":    "charm",
+    "optionOI":       "oi",
+    "optionVolume":   "volume",
+    "optionBidPrice": "bid",
+    "optionAskPrice": "ask",
+}
 
-    target_date   = date_input
-    target_str    = target_date.strftime("%Y-%m-%d")
-    et_label      = eat_to_et_label(date_input, time_input)
+def pivot_and_snapshot(df_all, target_et_dt):
+    """
+    Pivot to wide format.
+    Snapshot = latest row per strike with timestamp <= target_et_dt.
+    Also return the full time series for rate-of-change calculation.
+    """
+    def pivot_side(df, prefix):
+        rename = {k: f"{prefix}_{v}" for k, v in COL_MAP.items() if k in df.columns}
+        df = df.rename(columns=rename)
+        base = ["timestamp", "_strike", "underlyingPrice"] if prefix == "call" else ["timestamp", "_strike"]
+        keep = base + list(rename.values())
+        return df[[c for c in keep if c in df.columns]].copy()
 
-    # Spot price — user enters manually since we're pulling EOD data
-    spot = st.sidebar.number_input("SPX Spot Price (at session time)", value=float(center_strike), step=1.0)
+    calls_p = pivot_side(df_all[df_all["_optType"] == "C"].copy(), "call")
+    puts_p  = pivot_side(df_all[df_all["_optType"] == "P"].copy(), "put")
 
-    raw_df = fetch_spx_data(api_key, target_date, int(center_strike), int(num_strikes))
+    merged = calls_p.merge(puts_p, on=["timestamp", "_strike"], how="outer")
+    merged = merged.rename(columns={"_strike": "strike", "underlyingPrice": "spot"})
+    merged = merged.sort_values(["strike", "timestamp"]).reset_index(drop=True)
 
-    if raw_df is not None:
-        result_df, flip_strikes, has_charm, has_vanna = calculate_all(raw_df, spot)
-        interp = interpret_regime(result_df, flip_strikes)
-        display_results(result_df, interp, has_charm, has_vanna,
-                        date_label=target_str, et_label=et_label)
+    # Snapshot: latest bar at or before the requested ET time
+    # target_et_dt is a full datetime — match date + time
+    snap = (
+        merged[merged["timestamp"] <= pd.Timestamp(target_et_dt)]
+        .sort_values("timestamp")
+        .groupby("strike")
+        .last()
+        .reset_index()
+    )
 
-        if not has_charm:
-            st.caption("ℹ️ Charm not returned by API — DEX-2 unavailable")
-        if not has_vanna:
-            st.caption("ℹ️ Vanna not returned by API — DEX-3 unavailable")
+    # Session-open snapshot (first bar per strike)
+    open_snap = (
+        merged.sort_values("timestamp")
+        .groupby("strike")
+        .first()
+        .reset_index()
+    )
+
+    return snap, open_snap, merged
+
+# ─────────────────────────────────────────────────────────────
+# FORMULA ENGINE
+# ─────────────────────────────────────────────────────────────
+def calculate_formulas(df, spot_override=None):
+    out = df.copy()
+
+    # Use API spot if available, else fallback to user override
+    if "spot" in out.columns and out["spot"].notna().any():
+        # Per-row spot from API
+        spot_col = out["spot"].fillna(spot_override or 0)
+    else:
+        spot_col = pd.Series([spot_override or 0] * len(out), index=out.index)
+
+    out["spot_used"] = spot_col
+
+    cg   = out.get("call_gamma",  pd.Series(0.0, index=out.index)).fillna(0)
+    pg   = out.get("put_gamma",   pd.Series(0.0, index=out.index)).fillna(0)
+    coi  = out.get("call_oi",     pd.Series(0.0, index=out.index)).fillna(0)
+    poi  = out.get("put_oi",      pd.Series(0.0, index=out.index)).fillna(0)
+    cvol = out.get("call_volume", pd.Series(0.0, index=out.index)).fillna(0)
+    pvol = out.get("put_volume",  pd.Series(0.0, index=out.index)).fillna(0)
+    cd   = out.get("call_delta",  pd.Series(0.0, index=out.index)).fillna(0)
+    pd_  = out.get("put_delta",   pd.Series(0.0, index=out.index)).fillna(0)
+    cv   = out.get("call_vanna",  pd.Series(0.0, index=out.index)).fillna(0)
+    pv   = out.get("put_vanna",   pd.Series(0.0, index=out.index)).fillna(0)
+    cc   = out.get("call_charm",  pd.Series(0.0, index=out.index)).fillna(0)
+    pc   = out.get("put_charm",   pd.Series(0.0, index=out.index)).fillna(0)
+    civ  = out.get("call_iv",     pd.Series(np.nan, index=out.index))
+    piv  = out.get("put_iv",      pd.Series(np.nan, index=out.index))
+
+    S    = spot_col
+    S2   = S ** 2
+    mult = SPX_MULT
+
+    # Weighted OI: blend OI with volume (volume reflects intraday activity)
+    # Weight = 0.7 OI + 0.3 volume (volume normalised to OI scale)
+    vol_scale_c = (coi / cvol.replace(0, np.nan)).fillna(1).clip(0, 10)
+    vol_scale_p = (poi / pvol.replace(0, np.nan)).fillna(1).clip(0, 10)
+    cwoi = 0.7 * coi + 0.3 * (cvol * vol_scale_c)
+    pwoi = 0.7 * poi + 0.3 * (pvol * vol_scale_p)
+
+    # ATM IV for vanna adjustment
+    atm_iv      = civ.fillna(piv).mean()
+    iv_diff_c   = civ.fillna(atm_iv) - atm_iv
+    iv_diff_p   = piv.fillna(atm_iv) - atm_iv
+
+    # DTE proxy for charm (minutes to close / 390 minutes in session)
+    # App uses snapshot time — dte_fraction passed from caller if available
+    # Default to 0.5 session if not available
+    dte_frac    = out.get("_dte_frac", pd.Series(0.5, index=out.index)).fillna(0.5)
+
+    # ── GEX FORMULAS ────────────────────────────────────────
+    # GEX-1: Standard — dealers short all options
+    out["GEX1"]    = (cg*coi   - pg*poi)   * mult * S2
+    out["GEX1_$"]  = out["GEX1"] * S / 1e9
+
+    # GEX-2: Sign-corrected — dealers long puts (stabilising)
+    out["GEX2"]    = (cg*coi   + pg*poi)   * mult * S2
+    out["GEX2_$"]  = out["GEX2"] * S / 1e9
+
+    # GEX-3: OI-skew weighted — dynamic put contribution
+    total_oi       = (coi + poi).replace(0, np.nan)
+    skew           = (coi / total_oi).fillna(0.5)
+    out["GEX3"]    = (cg*coi   - skew*pg*poi) * mult * S2
+    out["GEX3_$"]  = out["GEX3"] * S / 1e9
+
+    # GEX-4: Volume-weighted OI
+    out["GEX4"]    = (cg*cwoi  - pg*pwoi)  * mult * S2
+    out["GEX4_$"]  = out["GEX4"] * S / 1e9
+
+    # GEX-5: Pure volume (no OI at all — intraday flow only)
+    out["GEX5"]    = (cg*cvol  - pg*pvol)  * mult * S2
+    out["GEX5_$"]  = out["GEX5"] * S / 1e9
+
+    # ── DEX FORMULAS ────────────────────────────────────────
+    # DEX-1: Standard
+    out["DEX1"]    = (cd*coi   - pd_*poi)  * mult * S
+    out["DEX1_$"]  = out["DEX1"] * S / 1e9
+
+    # DEX-2: Volume-weighted OI
+    out["DEX2"]    = (cd*cwoi  - pd_*pwoi) * mult * S
+    out["DEX2_$"]  = out["DEX2"] * S / 1e9
+
+    # DEX-3: Pure volume
+    out["DEX3"]    = (cd*cvol  - pd_*pvol) * mult * S
+    out["DEX3_$"]  = out["DEX3"] * S / 1e9
+
+    # DEX-4: Charm-adjusted (0DTE — delta decay over remaining session)
+    charm_flow     = (cc*coi - pc*poi) * mult * dte_frac
+    out["DEX4"]    = out["DEX1"] - charm_flow * S
+    out["DEX4_$"]  = out["DEX4"] * S / 1e9
+
+    # DEX-5: Vanna-adjusted (IV-surface driven delta shift)
+    vanna_flow     = (cv*coi*iv_diff_c - pv*poi*iv_diff_p) * mult
+    out["DEX5"]    = out["DEX1"] + vanna_flow * S
+    out["DEX5_$"]  = out["DEX5"] * S / 1e9
+
+    # ── GAMMA FLIP per-strike ────────────────────────────────
+    g = out["GEX1"].values
+    flip = []
+    for i in range(1, len(g)):
+        if not np.isnan(g[i-1]) and not np.isnan(g[i]) and g[i-1] * g[i] < 0:
+            flip.append(out["strike"].iloc[i])
+    out["_flip"] = out["strike"].isin(flip)
+
+    return out, flip
+
+def rate_of_change(snap_now, snap_open):
+    """
+    % change in each GEX/DEX formula from session open to current snapshot.
+    """
+    gex_dex_cols = [c for c in snap_now.columns if c.startswith(("GEX", "DEX")) and not c.endswith("_$")]
+    roc = {}
+    for col in gex_dex_cols:
+        if col in snap_open.columns:
+            merged = snap_now[["strike", col]].merge(
+                snap_open[["strike", col]].rename(columns={col: f"{col}_open"}),
+                on="strike", how="left"
+            )
+            open_vals = merged[f"{col}_open"].replace(0, np.nan)
+            roc[f"{col}_roc%"] = ((merged[col] - merged[f"{col}_open"]) / open_vals.abs() * 100).round(2).values
+    roc_df = pd.DataFrame(roc, index=snap_now.index)
+    return pd.concat([snap_now, roc_df], axis=1)
+
+# ─────────────────────────────────────────────────────────────
+# REGIME
+# ─────────────────────────────────────────────────────────────
+def interpret_regime(df, flip_strikes):
+    net = {}
+    for col in [c for c in df.columns if c.startswith(("GEX","DEX")) and not c.endswith(("_$","roc%","_flip"))]:
+        net[col] = df[col].sum()
+
+    gex1_neg = net.get("GEX1", 0) < 0
+    dex1_pos = net.get("DEX1", 0) > 0
+
+    regime = "🔴 Negative Gamma — Trending / Volatile" if gex1_neg else "🟢 Positive Gamma — Mean-Reverting / Pinned"
+
+    if gex1_neg and dex1_pos:
+        signal = "⚡ Bullish Move — Negative GEX + Positive DEX"
+    elif gex1_neg and not dex1_pos:
+        signal = "⚡ Bearish Move — Negative GEX + Negative DEX"
+    else:
+        signal = "🔒 Pin / Fade — Positive GEX, expect mean reversion"
+
+    flip_str = ", ".join(str(s) for s in flip_strikes) if flip_strikes else "None in range"
+    return regime, signal
