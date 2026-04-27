@@ -15,34 +15,40 @@ from datetime import datetime, timedelta, time, date
 from scipy.stats import norm
 
 st.set_page_config(page_title="SPX GEX/DEX Analyzer", layout="wide")
-st.title("SPX GEX / DEX Multi-Formula Analyzer")
+st.title("📊 SPX GEX / DEX Analyzer")
 
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────
-BASE_URL    = "https://restapi.ivolatility.com"
-RATE_LIMIT  = 1.2
-POLL_DELAY  = 2.0
-SPX_MULT    = 100
-RISK_FREE   = 0.0525
+BASE_URL      = "https://restapi.ivolatility.com"
+MIN_DELAY     = 1.05   # strictly > 1s between every API request
+POLL_DELAY    = 2.1
+SPX_MULT      = 100
+RISK_FREE     = 0.0525
 SESSION_START = time(9, 30)
 SESSION_END   = time(16, 0)
 
+_last_request_time = [0.0]   # mutable container for rate limiter
+
+def rate_limited_get(url, headers, params):
+    """Enforce >= 1.05s between every outbound request."""
+    elapsed = time_module.time() - _last_request_time[0]
+    if elapsed < MIN_DELAY:
+        time_module.sleep(MIN_DELAY - elapsed)
+    r = requests.get(url, headers=headers, params=params)
+    _last_request_time[0] = time_module.time()
+    return r
+
 # ─────────────────────────────────────────────────────────────
-# TIMEZONE — EAT to ET
-# EAT = UTC+3, EST = UTC-5 → EAT is 8h ahead of EST
-# EDT = UTC-4 → EAT is 7h ahead of EDT
-# US markets observe EDT Mar-Nov, EST Nov-Mar
+# TIMEZONE HELPERS
 # ─────────────────────────────────────────────────────────────
 def eat_to_et(d, t):
     eat_dt = datetime.combine(d, t)
-    # Rough DST: EDT Mar 2nd Sun – Nov 1st Sun
-    month = d.month
-    is_edt = 3 <= month <= 10
+    month  = d.month
+    is_edt = 3 <= month <= 10          # rough DST window
     offset = timedelta(hours=7 if is_edt else 8)
     et_dt  = eat_dt - offset
-    tz_str = "EDT" if is_edt else "EST"
-    return et_dt, tz_str
+    return et_dt, ("EDT" if is_edt else "EST")
 
 def prev_trading_day(d):
     step = 3 if d.weekday() == 0 else 1
@@ -96,9 +102,8 @@ def find_poll_url(obj, depth=0):
             if f: return f
     return None
 
-def async_download(endpoint, params, headers, label="", max_polls=20):
-    time_module.sleep(RATE_LIMIT)
-    r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
+def async_download(endpoint, params, headers, label="", max_polls=25):
+    r = rate_limited_get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
     if r.status_code != 200:
         st.error(f"[{label}] HTTP {r.status_code}: {r.text[:200]}")
         return None
@@ -107,21 +112,21 @@ def async_download(endpoint, params, headers, label="", max_polls=20):
     if url: return url
     poll_url = find_poll_url(body)
     if not poll_url:
-        st.error(f"[{label}] No poll URL")
+        st.error(f"[{label}] No poll URL found")
         return None
     for attempt in range(1, max_polls+1):
         time_module.sleep(POLL_DELAY)
-        rp = requests.get(poll_url, headers=headers, params={"apiKey": params["apiKey"]})
-        if rp.status_code == 429: time_module.sleep(3); continue
+        rp = rate_limited_get(poll_url, headers=headers, params={"apiKey": params["apiKey"]})
+        if rp.status_code == 429:
+            time_module.sleep(3); continue
         if rp.status_code != 200: continue
         url = find_download_url(rp.json())
         if url: return url
-    st.error(f"[{label}] Polling timed out")
+    st.error(f"[{label}] Polling timed out after {max_polls} attempts")
     return None
 
 def download_csv_gz(url, headers, api_key, label=""):
-    time_module.sleep(RATE_LIMIT)
-    r = requests.get(url, headers=headers, params={"apiKey": api_key})
+    r = rate_limited_get(url, headers=headers, params={"apiKey": api_key})
     if r.status_code != 200: return None
     try:
         with gzip.open(io.BytesIO(r.content), "rt") as f:
@@ -134,11 +139,10 @@ def download_csv_gz(url, headers, api_key, label=""):
             return None
 
 def sync_call(endpoint, params, headers, label=""):
-    time_module.sleep(RATE_LIMIT)
-    r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
+    r = rate_limited_get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
     if r.status_code == 429:
         time_module.sleep(3)
-        r = requests.get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
+        r = rate_limited_get(f"{BASE_URL}{endpoint}", headers=headers, params=params)
     if r.status_code != 200: return None
     body    = r.json()
     records = body.get("data", []) if isinstance(body, dict) else body
@@ -159,7 +163,7 @@ def get_option_ids(api_key, headers, prev_date_str, exp_date_str, strike_min, st
     if series_df is None or series_df.empty:
         st.error("Empty option series"); return None, None
 
-    series_df.columns      = [c.strip().lower() for c in series_df.columns]
+    series_df.columns           = [c.strip().lower() for c in series_df.columns]
     series_df["expirationdate"] = pd.to_datetime(series_df["expirationdate"])
     series_df["strike"]         = pd.to_numeric(series_df["strike"], errors="coerce")
 
@@ -172,7 +176,8 @@ def get_option_ids(api_key, headers, prev_date_str, exp_date_str, strike_min, st
         st.error(f"No contracts found for expiry {exp_date_str} in strike range {strike_min}–{strike_max}")
         return None, None
 
-    cp_col = next((c for c in filtered.columns if c in ["callput","call_put","type","optiontype"]), None)
+    cp_col = next((c for c in filtered.columns
+                   if c in ["callput","call_put","type","optiontype"]), None)
     if not cp_col:
         st.error("Cannot identify call/put column"); return None, None
 
@@ -186,7 +191,7 @@ def get_option_ids(api_key, headers, prev_date_str, exp_date_str, strike_min, st
     return calls, puts
 
 # ─────────────────────────────────────────────────────────────
-# STEP 2 — EOD OI from prev day
+# STEP 2 — EOD OI from prev close
 # ─────────────────────────────────────────────────────────────
 def get_eod_oi(api_key, headers, calls, puts, prev_date_str):
     oi_map = {}
@@ -196,7 +201,8 @@ def get_eod_oi(api_key, headers, calls, puts, prev_date_str):
         strike = float(row["strike"])
         rec    = sync_call(
             "/equities/eod/single-stock-option-raw-iv",
-            {"optionId": oid, "from": prev_date_str, "to": prev_date_str, "apiKey": api_key},
+            {"optionId": oid, "from": prev_date_str,
+             "to": prev_date_str, "apiKey": api_key},
             headers, label=f"{cp_label}{int(strike)}"
         )
         if not rec: return
@@ -214,8 +220,9 @@ def get_eod_oi(api_key, headers, calls, puts, prev_date_str):
 # ─────────────────────────────────────────────────────────────
 # STEP 3 — Intraday Greeks
 # ─────────────────────────────────────────────────────────────
-def get_intraday_greeks(api_key, date_str, exp_date_str, strike_min, strike_max,
-                        strike_step, minute_type, oi_map, progress_bar):
+def get_intraday_greeks(api_key, date_str, exp_date_str,
+                        strike_min, strike_max, strike_step,
+                        minute_type, oi_map, progress_bar):
     ivol.setLoginParams(apiKey=api_key)
     get_intra = ivol.setMethod("/equities/intraday/single-equity-option-rawiv")
 
@@ -225,40 +232,52 @@ def get_intraday_greeks(api_key, date_str, exp_date_str, strike_min, strike_max,
     all_data  = []
     count     = 0
 
-    close_dt  = datetime(
+    close_dt = datetime(
         int(date_str[:4]), int(date_str[5:7]), int(date_str[8:10]), 16, 0
     )
 
     for strike in strikes:
         for opt_type in opt_types:
             count += 1
-            progress_bar.progress(count / total, text=f"Fetching {strike}{opt_type} ({count}/{total})")
+            progress_bar.progress(
+                count / total,
+                text=f"Fetching {strike}{opt_type}  ({count}/{total})"
+            )
             try:
+                # ivolatility library manages its own request;
+                # sleep before to honour rate limit
+                time_module.sleep(MIN_DELAY)
                 df = get_intra(
                     symbol="SPX", date=date_str, expDate=exp_date_str,
-                    strike=str(strike), optType=opt_type, minuteType=minute_type
+                    strike=str(strike), optType=opt_type,
+                    minuteType=minute_type
                 )
-                if df is None or len(df) == 0:
-                    time_module.sleep(RATE_LIMIT); continue
+                _last_request_time[0] = time_module.time()
+
+                if df is None or len(df) == 0: continue
 
                 df = df.copy()
                 df["_strike"]  = strike
                 df["_optType"] = opt_type
 
-                # Filter bad IV rows — IV=-1 means Greeks not calculated
+                # Drop rows where IV is -1 or NaN — Greeks are invalid
                 if "optionIv" in df.columns:
                     df["optionIv"] = pd.to_numeric(df["optionIv"], errors="coerce")
-                    df = df[df["optionIv"].notna() & (df["optionIv"] > 0) & (df["optionIv"] != -1)].copy()
+                    df = df[
+                        df["optionIv"].notna() &
+                        (df["optionIv"] > 0) &
+                        (df["optionIv"] != -1)
+                    ].copy()
 
-                if len(df) == 0:
-                    time_module.sleep(RATE_LIMIT); continue
+                if len(df) == 0: continue
 
                 # Stamp EOD OI
                 df["optionOI"] = df.apply(
-                    lambda r: oi_map.get((float(r["_strike"]), r["_optType"]), np.nan), axis=1
+                    lambda r: oi_map.get((float(r["_strike"]), r["_optType"]), np.nan),
+                    axis=1
                 )
 
-                # DTE in years from each timestamp to session close
+                # DTE in years per timestamp
                 df["timestamp"] = pd.to_datetime(df["timestamp"])
                 df["_dte_years"] = df["timestamp"].apply(
                     lambda ts: max(
@@ -267,7 +286,7 @@ def get_intraday_greeks(api_key, date_str, exp_date_str, strike_min, strike_max,
                     )
                 )
 
-                # BSM Vanna & Charm
+                # BSM Vanna & Charm from intraday IV
                 df["optionVanna"] = df.apply(
                     lambda r: bsm_vanna(
                         r.get("underlyingPrice", np.nan), r["_strike"],
@@ -282,23 +301,21 @@ def get_intraday_greeks(api_key, date_str, exp_date_str, strike_min, strike_max,
                 )
 
                 all_data.append(df)
+
             except Exception as e:
                 st.warning(f"Error {strike}{opt_type}: {e}")
 
-            time_module.sleep(RATE_LIMIT)
-
     if not all_data: return None
 
-    combined = pd.concat(all_data, ignore_index=True)
+    combined              = pd.concat(all_data, ignore_index=True)
     combined["timestamp"] = pd.to_datetime(combined["timestamp"])
-
     return combined[
         (combined["timestamp"].dt.time >= SESSION_START) &
         (combined["timestamp"].dt.time <= SESSION_END)
     ].copy()
 
 # ─────────────────────────────────────────────────────────────
-# STEP 4 — Pivot wide + select snapshot at requested time
+# STEP 4 — Pivot wide + snapshot at requested time
 # ─────────────────────────────────────────────────────────────
 COL_MAP = {
     "optionDelta":    "delta",
@@ -312,17 +329,13 @@ COL_MAP = {
     "optionAskPrice": "ask",
 }
 
-def pivot_and_snapshot(df_all, target_et_dt):
-    """
-    Pivot to wide format.
-    Snapshot = latest row per strike with timestamp <= target_et_dt.
-    Also return the full time series for rate-of-change calculation.
-    """
+def pivot_and_snapshot(df_all, target_et_full, intra_date):
     def pivot_side(df, prefix):
         rename = {k: f"{prefix}_{v}" for k, v in COL_MAP.items() if k in df.columns}
-        df = df.rename(columns=rename)
-        base = ["timestamp", "_strike", "underlyingPrice"] if prefix == "call" else ["timestamp", "_strike"]
-        keep = base + list(rename.values())
+        df     = df.rename(columns=rename)
+        base   = (["timestamp", "_strike", "underlyingPrice"]
+                  if prefix == "call" else ["timestamp", "_strike"])
+        keep   = base + list(rename.values())
         return df[[c for c in keep if c in df.columns]].copy()
 
     calls_p = pivot_side(df_all[df_all["_optType"] == "C"].copy(), "call")
@@ -332,21 +345,16 @@ def pivot_and_snapshot(df_all, target_et_dt):
     merged = merged.rename(columns={"_strike": "strike", "underlyingPrice": "spot"})
     merged = merged.sort_values(["strike", "timestamp"]).reset_index(drop=True)
 
-    # Snapshot: latest bar at or before the requested ET time
-    # target_et_dt is a full datetime — match date + time
     snap = (
-        merged[merged["timestamp"] <= pd.Timestamp(target_et_dt)]
+        merged[merged["timestamp"] <= pd.Timestamp(target_et_full)]
         .sort_values("timestamp")
-        .groupby("strike")
-        .last()
+        .groupby("strike").last()
         .reset_index()
     )
 
-    # Session-open snapshot (first bar per strike)
     open_snap = (
         merged.sort_values("timestamp")
-        .groupby("strike")
-        .first()
+        .groupby("strike").first()
         .reset_index()
     )
 
@@ -355,139 +363,135 @@ def pivot_and_snapshot(df_all, target_et_dt):
 # ─────────────────────────────────────────────────────────────
 # FORMULA ENGINE
 # ─────────────────────────────────────────────────────────────
-def calculate_formulas(df, spot_override=None):
+def calculate_formulas(df, spot_override, dte_frac_default=0.5):
     out = df.copy()
 
-    # Use API spot if available, else fallback to user override
-    if "spot" in out.columns and out["spot"].notna().any():
-        # Per-row spot from API
-        spot_col = out["spot"].fillna(spot_override or 0)
-    else:
-        spot_col = pd.Series([spot_override or 0] * len(out), index=out.index)
-
+    spot_col = (out["spot"].fillna(spot_override)
+                if "spot" in out.columns else
+                pd.Series([spot_override] * len(out), index=out.index))
     out["spot_used"] = spot_col
 
-    cg   = out.get("call_gamma",  pd.Series(0.0, index=out.index)).fillna(0)
-    pg   = out.get("put_gamma",   pd.Series(0.0, index=out.index)).fillna(0)
-    coi  = out.get("call_oi",     pd.Series(0.0, index=out.index)).fillna(0)
-    poi  = out.get("put_oi",      pd.Series(0.0, index=out.index)).fillna(0)
-    cvol = out.get("call_volume", pd.Series(0.0, index=out.index)).fillna(0)
-    pvol = out.get("put_volume",  pd.Series(0.0, index=out.index)).fillna(0)
-    cd   = out.get("call_delta",  pd.Series(0.0, index=out.index)).fillna(0)
-    pd_  = out.get("put_delta",   pd.Series(0.0, index=out.index)).fillna(0)
-    cv   = out.get("call_vanna",  pd.Series(0.0, index=out.index)).fillna(0)
-    pv   = out.get("put_vanna",   pd.Series(0.0, index=out.index)).fillna(0)
-    cc   = out.get("call_charm",  pd.Series(0.0, index=out.index)).fillna(0)
-    pc   = out.get("put_charm",   pd.Series(0.0, index=out.index)).fillna(0)
-    civ  = out.get("call_iv",     pd.Series(np.nan, index=out.index))
-    piv  = out.get("put_iv",      pd.Series(np.nan, index=out.index))
+    def col(name): return out.get(name, pd.Series(0.0, index=out.index)).fillna(0)
+
+    cg   = col("call_gamma");  pg   = col("put_gamma")
+    coi  = col("call_oi");     poi  = col("put_oi")
+    cvol = col("call_volume"); pvol = col("put_volume")
+    cd   = col("call_delta");  pd_  = col("put_delta")
+    cv   = col("call_vanna");  pv   = col("put_vanna")
+    cc   = col("call_charm");  pc   = col("put_charm")
+    civ  = out.get("call_iv",  pd.Series(np.nan, index=out.index))
+    piv  = out.get("put_iv",   pd.Series(np.nan, index=out.index))
 
     S    = spot_col
     S2   = S ** 2
-    mult = SPX_MULT
+    M    = SPX_MULT
 
-    # Weighted OI: blend OI with volume (volume reflects intraday activity)
-    # Weight = 0.7 OI + 0.3 volume (volume normalised to OI scale)
-    vol_scale_c = (coi / cvol.replace(0, np.nan)).fillna(1).clip(0, 10)
-    vol_scale_p = (poi / pvol.replace(0, np.nan)).fillna(1).clip(0, 10)
-    cwoi = 0.7 * coi + 0.3 * (cvol * vol_scale_c)
-    pwoi = 0.7 * poi + 0.3 * (pvol * vol_scale_p)
+    # Weighted OI — blend EOD OI (70%) with intraday volume (30%)
+    # Volume is normalised to OI scale before blending
+    vsc  = (coi / cvol.replace(0, np.nan)).fillna(1).clip(0, 10)
+    vsp  = (poi / pvol.replace(0, np.nan)).fillna(1).clip(0, 10)
+    cwoi = 0.7 * coi + 0.3 * (cvol * vsc)
+    pwoi = 0.7 * poi + 0.3 * (pvol * vsp)
 
-    # ATM IV for vanna adjustment
-    atm_iv      = civ.fillna(piv).mean()
-    iv_diff_c   = civ.fillna(atm_iv) - atm_iv
-    iv_diff_p   = piv.fillna(atm_iv) - atm_iv
+    # ATM IV proxy for vanna adjustment
+    atm_iv    = civ.fillna(piv).mean()
+    iv_diff_c = civ.fillna(atm_iv) - atm_iv
+    iv_diff_p = piv.fillna(atm_iv) - atm_iv
 
-    # DTE proxy for charm (minutes to close / 390 minutes in session)
-    # App uses snapshot time — dte_fraction passed from caller if available
-    # Default to 0.5 session if not available
-    dte_frac    = out.get("_dte_frac", pd.Series(0.5, index=out.index)).fillna(0.5)
+    # DTE fraction (remaining session time / full session)
+    dte_frac = (out["_dte_frac"].fillna(dte_frac_default)
+                if "_dte_frac" in out.columns else
+                pd.Series(dte_frac_default, index=out.index))
 
-    # ── GEX FORMULAS ────────────────────────────────────────
-    # GEX-1: Standard — dealers short all options
-    out["GEX1"]    = (cg*coi   - pg*poi)   * mult * S2
-    out["GEX1_$"]  = out["GEX1"] * S / 1e9
+    # ── GEX ─────────────────────────────────────────────────
+    # GEX-1: Standard (dealers short all)
+    out["GEX1"]   = (cg*coi  - pg*poi)       * M * S2
+    out["GEX1_$"] = out["GEX1"] * S / 1e9
 
-    # GEX-2: Sign-corrected — dealers long puts (stabilising)
-    out["GEX2"]    = (cg*coi   + pg*poi)   * mult * S2
-    out["GEX2_$"]  = out["GEX2"] * S / 1e9
+    # GEX-2: Sign-corrected (dealers long puts — puts stabilise)
+    out["GEX2"]   = (cg*coi  + pg*poi)       * M * S2
+    out["GEX2_$"] = out["GEX2"] * S / 1e9
 
-    # GEX-3: OI-skew weighted — dynamic put contribution
-    total_oi       = (coi + poi).replace(0, np.nan)
-    skew           = (coi / total_oi).fillna(0.5)
-    out["GEX3"]    = (cg*coi   - skew*pg*poi) * mult * S2
-    out["GEX3_$"]  = out["GEX3"] * S / 1e9
+    # GEX-3: OI-skew weighted
+    total_oi      = (coi + poi).replace(0, np.nan)
+    skew          = (coi / total_oi).fillna(0.5)
+    out["GEX3"]   = (cg*coi  - skew*pg*poi)  * M * S2
+    out["GEX3_$"] = out["GEX3"] * S / 1e9
 
-    # GEX-4: Volume-weighted OI
-    out["GEX4"]    = (cg*cwoi  - pg*pwoi)  * mult * S2
-    out["GEX4_$"]  = out["GEX4"] * S / 1e9
+    # GEX-4: Weighted OI (OI + volume blend)
+    out["GEX4"]   = (cg*cwoi - pg*pwoi)      * M * S2
+    out["GEX4_$"] = out["GEX4"] * S / 1e9
 
-    # GEX-5: Pure volume (no OI at all — intraday flow only)
-    out["GEX5"]    = (cg*cvol  - pg*pvol)  * mult * S2
-    out["GEX5_$"]  = out["GEX5"] * S / 1e9
+    # GEX-5: Pure intraday volume
+    out["GEX5"]   = (cg*cvol - pg*pvol)      * M * S2
+    out["GEX5_$"] = out["GEX5"] * S / 1e9
 
-    # ── DEX FORMULAS ────────────────────────────────────────
+    # ── DEX ─────────────────────────────────────────────────
     # DEX-1: Standard
-    out["DEX1"]    = (cd*coi   - pd_*poi)  * mult * S
-    out["DEX1_$"]  = out["DEX1"] * S / 1e9
+    out["DEX1"]   = (cd*coi  - pd_*poi)      * M * S
+    out["DEX1_$"] = out["DEX1"] * S / 1e9
 
-    # DEX-2: Volume-weighted OI
-    out["DEX2"]    = (cd*cwoi  - pd_*pwoi) * mult * S
-    out["DEX2_$"]  = out["DEX2"] * S / 1e9
+    # DEX-2: Weighted OI
+    out["DEX2"]   = (cd*cwoi - pd_*pwoi)     * M * S
+    out["DEX2_$"] = out["DEX2"] * S / 1e9
 
     # DEX-3: Pure volume
-    out["DEX3"]    = (cd*cvol  - pd_*pvol) * mult * S
-    out["DEX3_$"]  = out["DEX3"] * S / 1e9
+    out["DEX3"]   = (cd*cvol - pd_*pvol)     * M * S
+    out["DEX3_$"] = out["DEX3"] * S / 1e9
 
-    # DEX-4: Charm-adjusted (0DTE — delta decay over remaining session)
-    charm_flow     = (cc*coi - pc*poi) * mult * dte_frac
-    out["DEX4"]    = out["DEX1"] - charm_flow * S
-    out["DEX4_$"]  = out["DEX4"] * S / 1e9
+    # DEX-4: Charm-adjusted (0DTE delta decay over remaining session)
+    charm_flow    = (cc*coi  - pc*poi)  * M * dte_frac
+    out["DEX4"]   = out["DEX1"] - charm_flow * S
+    out["DEX4_$"] = out["DEX4"] * S / 1e9
 
-    # DEX-5: Vanna-adjusted (IV-surface driven delta shift)
-    vanna_flow     = (cv*coi*iv_diff_c - pv*poi*iv_diff_p) * mult
-    out["DEX5"]    = out["DEX1"] + vanna_flow * S
-    out["DEX5_$"]  = out["DEX5"] * S / 1e9
+    # DEX-5: Vanna-adjusted (IV surface delta shift)
+    vanna_flow    = (cv*coi*iv_diff_c - pv*poi*iv_diff_p) * M
+    out["DEX5"]   = out["DEX1"] + vanna_flow * S
+    out["DEX5_$"] = out["DEX5"] * S / 1e9
 
-    # ── GAMMA FLIP per-strike ────────────────────────────────
-    g = out["GEX1"].values
-    flip = []
+    # ── Gamma flip per-strike ────────────────────────────────
+    g     = out["GEX1"].values
+    flips = []
     for i in range(1, len(g)):
-        if not np.isnan(g[i-1]) and not np.isnan(g[i]) and g[i-1] * g[i] < 0:
-            flip.append(out["strike"].iloc[i])
-    out["_flip"] = out["strike"].isin(flip)
+        if not (np.isnan(g[i-1]) or np.isnan(g[i])) and g[i-1] * g[i] < 0:
+            flips.append(out["strike"].iloc[i])
+    out["_flip"] = out["strike"].isin(flips)
 
-    return out, flip
+    return out, flips
 
 def rate_of_change(snap_now, snap_open):
-    """
-    % change in each GEX/DEX formula from session open to current snapshot.
-    """
-    gex_dex_cols = [c for c in snap_now.columns if c.startswith(("GEX", "DEX")) and not c.endswith("_$")]
-    roc = {}
-    for col in gex_dex_cols:
-        if col in snap_open.columns:
-            merged = snap_now[["strike", col]].merge(
-                snap_open[["strike", col]].rename(columns={col: f"{col}_open"}),
-                on="strike", how="left"
-            )
-            open_vals = merged[f"{col}_open"].replace(0, np.nan)
-            roc[f"{col}_roc%"] = ((merged[col] - merged[f"{col}_open"]) / open_vals.abs() * 100).round(2).values
-    roc_df = pd.DataFrame(roc, index=snap_now.index)
-    return pd.concat([snap_now, roc_df], axis=1)
+    formula_cols = [c for c in snap_now.columns
+                    if c.startswith(("GEX","DEX")) and not c.endswith(("_$","roc%","_flip"))]
+    roc_parts = []
+    for col in formula_cols:
+        if col not in snap_open.columns: continue
+        merged = snap_now[["strike", col]].merge(
+            snap_open[["strike", col]].rename(columns={col: f"{col}_open"}),
+            on="strike", how="left"
+        )
+        open_v        = merged[f"{col}_open"].replace(0, np.nan)
+        roc_series    = ((merged[col] - merged[f"{col}_open"]) / open_v.abs() * 100).round(2)
+        roc_series.name = f"{col}_roc%"
+        roc_parts.append(roc_series)
+    if roc_parts:
+        return pd.concat([snap_now.reset_index(drop=True)] + roc_parts, axis=1)
+    return snap_now
 
 # ─────────────────────────────────────────────────────────────
 # REGIME
 # ─────────────────────────────────────────────────────────────
 def interpret_regime(df, flip_strikes):
-    net = {}
-    for col in [c for c in df.columns if c.startswith(("GEX","DEX")) and not c.endswith(("_$","roc%","_flip"))]:
-        net[col] = df[col].sum()
+    formula_cols = [c for c in df.columns
+                    if c.startswith(("GEX","DEX")) and
+                    not c.endswith(("_$","roc%","_flip"))]
+    net = {col: df[col].sum() for col in formula_cols}
 
     gex1_neg = net.get("GEX1", 0) < 0
     dex1_pos = net.get("DEX1", 0) > 0
 
-    regime = "🔴 Negative Gamma — Trending / Volatile" if gex1_neg else "🟢 Positive Gamma — Mean-Reverting / Pinned"
+    regime = ("🔴 Negative Gamma — Trending / Volatile"
+              if gex1_neg else
+              "🟢 Positive Gamma — Mean-Reverting / Pinned")
 
     if gex1_neg and dex1_pos:
         signal = "⚡ Bullish Move — Negative GEX + Positive DEX"
@@ -496,5 +500,20 @@ def interpret_regime(df, flip_strikes):
     else:
         signal = "🔒 Pin / Fade — Positive GEX, expect mean reversion"
 
-    flip_str = ", ".join(str(s) for s in flip_strikes) if flip_strikes else "None in range"
-    return regime, signal
+    flip_str = (", ".join(str(s) for s in flip_strikes)
+                if flip_strikes else "None in range")
+    return regime, signal, flip_str, net
+
+# ─────────────────────────────────────────────────────────────
+# DISPLAY
+# ─────────────────────────────────────────────────────────────
+def fmt_b(val):
+    if pd.isna(val) or val is None: return "N/A"
+    v = float(val)
+    if abs(v) >= 1e9: return f"${v/1e9:.2f}B"
+    if abs(v) >= 1e6: return f"${v/1e6:.2f}M"
+    if abs(v) >= 1e3: return f"${v/1e3:.1f}K"
+    return f"${v:.2f}"
+
+def display_results(df, regime, signal, flip_str,
+         
