@@ -1,10 +1,10 @@
 # utils/calculations.py
 import pandas as pd
 import numpy as np
-from .constants import SPX_MULT
+from constants import SPX_MULT          # ← Fixed
 
 def apply_formulas(df, spot_override, intra_date):
-    """GEX and DEX formulas — this is the main file you will update most often"""
+    """GEX and DEX formulas"""
     out = df.copy()
 
     spot_col = (out["spot"].fillna(spot_override)
@@ -26,7 +26,6 @@ def apply_formulas(df, spot_override, intra_date):
     S2 = S ** 2
     M  = SPX_MULT
 
-    # ================== GEX FORMULAS ==================
     out["GEX_unsigned"]    = (cg * coi + pg * poi) * M * S2
     out["GEX_unsigned_$"]  = out["GEX_unsigned"] / 1e9
 
@@ -45,7 +44,6 @@ def apply_formulas(df, spot_override, intra_date):
     out["GEX_dealer_sp"]   = -(cg * coi + pg * poi) * M * S2
     out["GEX_dealer_sp_$"] = out["GEX_dealer_sp"] / 1e9
 
-    # ================== DEX FORMULA ==================
     out["DEX"]             = (cd * coi + pd_ * poi) * M * S
     out["DEX_$"]           = out["DEX"] / 1e9
 
