@@ -8,8 +8,9 @@ import numpy as np
 from datetime import datetime, date
 
 from config   import STRIKE_STEP
-from utils    import (prev_trading_day, et_to_eat,
-                      fmt_b, fmt_df_dollars)
+# was:  from utils import (prev_trading_day, et_to_eat, fmt_b, fmt_df_dollars)
+from helpers import (prev_trading_day, et_to_eat,
+                     fmt_b, fmt_df_dollars)
 from data_fetch import (get_session_price_range, get_option_ids,
                         get_eod_oi, get_intraday_greeks)
 from pipeline import (pivot_wide, build_minute_series,
