@@ -1,6 +1,7 @@
 # ─────────────────────────────────────────────────────────────
 # SPX GEX / DEX Multi-Formula Analyzer — Streamlit App
 # pip install streamlit requests pandas scipy ivolatility
+#             streamlit-lightweight-charts
 # ─────────────────────────────────────────────────────────────
 
 import streamlit as st
@@ -13,6 +14,7 @@ import io
 import time as time_module
 from datetime import datetime, timedelta, time, date
 from scipy.stats import norm
+from streamlit_lightweight_charts import renderLightweightCharts
 
 st.set_page_config(page_title="SPX GEX/DEX Analyzer", layout="wide")
 st.title("📊 SPX GEX / DEX Analyzer")
@@ -27,6 +29,7 @@ SPX_MULT      = 100
 RISK_FREE     = 0.0525
 SESSION_START = time(9, 30)
 SESSION_END   = time(16, 0)
+STRIKE_STEP   = 5          # SPX 0DTE standard step
 
 _last_request_time = [0.0]
 
@@ -47,9 +50,19 @@ def eat_to_et(d, t):
     et_dt  = eat_dt - timedelta(hours=7 if is_edt else 8)
     return et_dt, ("EDT" if is_edt else "EST")
 
+def et_to_eat(dt_et, d):
+    is_edt = 3 <= d.month <= 10
+    return dt_et + timedelta(hours=7 if is_edt else 8)
+
 def prev_trading_day(d):
     step = 3 if d.weekday() == 0 else 1
     return d - timedelta(days=step)
+
+def session_open_et(d):
+    return datetime.combine(d, time(9, 30))
+
+def session_close_et(d):
+    return datetime.combine(d, time(16, 0))
 
 # ─────────────────────────────────────────────────────────────
 # BSM VANNA & CHARM
@@ -113,7 +126,8 @@ def async_download(endpoint, params, headers, label="", max_polls=25):
         return None
     for _ in range(1, max_polls+1):
         time_module.sleep(POLL_DELAY)
-        rp = rate_limited_get(poll_url, headers=headers, params={"apiKey": params["apiKey"]})
+        rp = rate_limited_get(poll_url, headers=headers,
+                               params={"apiKey": params["apiKey"]})
         if rp.status_code == 429: time_module.sleep(3); continue
         if rp.status_code != 200: continue
         url = find_download_url(rp.json())
@@ -146,7 +160,8 @@ def sync_call(endpoint, params, headers, label=""):
 # ─────────────────────────────────────────────────────────────
 # STEP 1 — Option IDs
 # ─────────────────────────────────────────────────────────────
-def get_option_ids(api_key, headers, prev_date_str, exp_date_str, strike_min, strike_max):
+def get_option_ids(api_key, headers, prev_date_str, exp_date_str,
+                   strike_min, strike_max):
     dl_url = async_download(
         "/equities/eod/option-series-on-date",
         {"symbol": "SPX", "date": prev_date_str, "apiKey": api_key},
@@ -163,11 +178,13 @@ def get_option_ids(api_key, headers, prev_date_str, exp_date_str, strike_min, st
     series_df["strike"]         = pd.to_numeric(series_df["strike"], errors="coerce")
 
     exp_mask    = series_df["expirationdate"] == pd.Timestamp(exp_date_str)
-    strike_mask = (series_df["strike"] >= strike_min) & (series_df["strike"] <= strike_max)
+    strike_mask = (series_df["strike"] >= strike_min) & \
+                  (series_df["strike"] <= strike_max)
     filtered    = series_df[exp_mask & strike_mask].copy()
 
     if filtered.empty:
-        st.error(f"No contracts for expiry {exp_date_str} in {strike_min}–{strike_max}")
+        st.error(f"No contracts for expiry {exp_date_str} in "
+                 f"{strike_min}–{strike_max}")
         return None, None
 
     cp_col = next((c for c in filtered.columns
@@ -175,7 +192,8 @@ def get_option_ids(api_key, headers, prev_date_str, exp_date_str, strike_min, st
     if not cp_col:
         st.error("Cannot identify call/put column"); return None, None
 
-    filtered["_is_spx"] = filtered["optionsymbol"].str.strip().str.startswith("SPX ")
+    filtered["_is_spx"] = (filtered["optionsymbol"]
+                           .str.strip().str.startswith("SPX "))
     filtered = (filtered.sort_values("_is_spx", ascending=False)
                         .drop_duplicates(subset=["strike", cp_col], keep="first")
                         .drop(columns=["_is_spx"])
@@ -193,45 +211,96 @@ def get_eod_oi(api_key, headers, calls, puts, prev_date_str):
         rec = sync_call(
             "/equities/eod/single-stock-option-raw-iv",
             {"optionId": int(row["optionid"]),
-             "from": prev_date_str, "to": prev_date_str, "apiKey": api_key},
+             "from": prev_date_str, "to": prev_date_str,
+             "apiKey": api_key},
             headers, label=f"{cp_label}{int(row['strike'])}"
         )
         if not rec: return
-        d      = {k.strip().lower().replace(" ", ""): v for k, v in rec[0].items()}
+        d      = {k.strip().lower().replace(" ", ""): v
+                  for k, v in rec[0].items()}
         oi_val = (d.get("openinterest") or d.get("open_interest") or
                   d.get("oi") or d.get("openint") or 0)
-        oi_map[(float(row["strike"]), cp_label)] = int(float(oi_val)) if oi_val else 0
+        oi_map[(float(row["strike"]), cp_label)] = \
+            int(float(oi_val)) if oi_val else 0
 
     for _, row in calls.iterrows(): fetch_oi(row, "C")
     for _, row in puts.iterrows():  fetch_oi(row, "P")
     return oi_map
 
 # ─────────────────────────────────────────────────────────────
-# STEP 3 — Intraday Greeks
+# STEP 3a — Pilot fetch: establish session high/low + spot range
+# Fetches ATM call only (1 strike) for the full session to read
+# underlyingPrice, then returns high/low so we can build the
+# final strike list before the full fetch.
+# ─────────────────────────────────────────────────────────────
+def get_session_price_range(api_key, date_str, exp_date_str,
+                             rough_center, minute_type="MINUTE_1"):
+    ivol.setLoginParams(apiKey=api_key)
+    get_intra = ivol.setMethod(
+        "/equities/intraday/single-equity-option-rawiv")
+
+    time_module.sleep(MIN_DELAY)
+    try:
+        df = get_intra(symbol="SPX", date=date_str,
+                       expDate=exp_date_str,
+                       strike=str(int(rough_center)),
+                       optType="C",
+                       minuteType=minute_type)
+        _last_request_time[0] = time_module.time()
+    except Exception as e:
+        st.warning(f"Pilot fetch failed: {e}"); return None, None
+
+    if df is None or len(df) == 0:
+        return None, None
+
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df[(df["timestamp"].dt.time >= SESSION_START) &
+            (df["timestamp"].dt.time <= SESSION_END)]
+
+    if "underlyingPrice" not in df.columns or df.empty:
+        return None, None
+
+    df["underlyingPrice"] = pd.to_numeric(df["underlyingPrice"],
+                                           errors="coerce")
+    lo = df["underlyingPrice"].min()
+    hi = df["underlyingPrice"].max()
+    return lo, hi
+
+# ─────────────────────────────────────────────────────────────
+# STEP 3b — Full intraday fetch (strike-by-strike, 1-min bars)
 # ─────────────────────────────────────────────────────────────
 def get_intraday_greeks(api_key, date_str, exp_date_str,
-                        strike_min, strike_max, strike_step,
+                        strike_min, strike_max,
                         minute_type, oi_map, progress_bar):
     ivol.setLoginParams(apiKey=api_key)
-    get_intra = ivol.setMethod("/equities/intraday/single-equity-option-rawiv")
+    get_intra = ivol.setMethod(
+        "/equities/intraday/single-equity-option-rawiv")
 
-    strikes  = list(range(int(strike_min), int(strike_max) + int(strike_step), int(strike_step)))
+    strikes  = list(range(int(strike_min),
+                          int(strike_max) + STRIKE_STEP,
+                          STRIKE_STEP))
     total    = len(strikes) * 2
     all_data = []
     count    = 0
-    close_dt = datetime(int(date_str[:4]), int(date_str[5:7]), int(date_str[8:10]), 16, 0)
+    close_dt = datetime(int(date_str[:4]),
+                        int(date_str[5:7]),
+                        int(date_str[8:10]), 16, 0)
 
     for strike in strikes:
         for opt_type in ["C", "P"]:
             count += 1
-            progress_bar.progress(count / total,
-                                  text=f"Fetching {strike}{opt_type}  ({count}/{total})")
+            progress_bar.progress(
+                count / total,
+                text=f"Fetching {strike}{opt_type}  ({count}/{total})")
             try:
                 time_module.sleep(MIN_DELAY)
                 df = get_intra(
-                    symbol="SPX", date=date_str, expDate=exp_date_str,
-                    strike=str(strike), optType=opt_type, minuteType=minute_type
-                )
+                    symbol="SPX", date=date_str,
+                    expDate=exp_date_str,
+                    strike=str(strike),
+                    optType=opt_type,
+                    minuteType=minute_type)
                 _last_request_time[0] = time_module.time()
                 if df is None or len(df) == 0: continue
 
@@ -240,26 +309,34 @@ def get_intraday_greeks(api_key, date_str, exp_date_str,
                 df["_optType"] = opt_type
 
                 if "optionIv" in df.columns:
-                    df["optionIv"] = pd.to_numeric(df["optionIv"], errors="coerce")
+                    df["optionIv"] = pd.to_numeric(df["optionIv"],
+                                                    errors="coerce")
                     df = df[df["optionIv"].notna() &
                             (df["optionIv"] > 0) &
                             (df["optionIv"] != -1)].copy()
 
                 if len(df) == 0: continue
 
-                df["optionOI"]   = df.apply(
-                    lambda r: oi_map.get((float(r["_strike"]), r["_optType"]), np.nan), axis=1)
+                df["optionOI"] = df.apply(
+                    lambda r: oi_map.get(
+                        (float(r["_strike"]), r["_optType"]), np.nan),
+                    axis=1)
                 df["timestamp"]  = pd.to_datetime(df["timestamp"])
                 df["_dte_years"] = df["timestamp"].apply(
                     lambda ts: max(
-                        (close_dt - ts.to_pydatetime()).total_seconds() / (252 * 6.5 * 3600),
+                        (close_dt - ts.to_pydatetime()
+                         ).total_seconds() / (252 * 6.5 * 3600),
                         1e-8))
                 df["optionVanna"] = df.apply(
-                    lambda r: bsm_vanna(r.get("underlyingPrice", np.nan), r["_strike"],
-                                        r["_dte_years"], RISK_FREE, r.get("optionIv", np.nan)), axis=1)
+                    lambda r: bsm_vanna(
+                        r.get("underlyingPrice", np.nan),
+                        r["_strike"], r["_dte_years"],
+                        RISK_FREE, r.get("optionIv", np.nan)), axis=1)
                 df["optionCharm"] = df.apply(
-                    lambda r: bsm_charm(r.get("underlyingPrice", np.nan), r["_strike"],
-                                        r["_dte_years"], RISK_FREE, r.get("optionIv", np.nan)), axis=1)
+                    lambda r: bsm_charm(
+                        r.get("underlyingPrice", np.nan),
+                        r["_strike"], r["_dte_years"],
+                        RISK_FREE, r.get("optionIv", np.nan)), axis=1)
                 all_data.append(df)
             except Exception as e:
                 st.warning(f"Error {strike}{opt_type}: {e}")
@@ -289,418 +366,144 @@ COL_MAP = {
 
 def pivot_wide(df_all):
     def pivot_side(df, prefix):
-        rename = {k: f"{prefix}_{v}" for k, v in COL_MAP.items() if k in df.columns}
+        rename = {k: f"{prefix}_{v}"
+                  for k, v in COL_MAP.items() if k in df.columns}
         df     = df.rename(columns=rename)
         base   = (["timestamp", "_strike", "underlyingPrice"]
-                  if prefix == "call" else ["timestamp", "_strike"])
+                  if prefix == "call"
+                  else ["timestamp", "_strike"])
         keep   = base + list(rename.values())
         return df[[c for c in keep if c in df.columns]].copy()
 
-    calls_p = pivot_side(df_all[df_all["_optType"] == "C"].copy(), "call")
-    puts_p  = pivot_side(df_all[df_all["_optType"] == "P"].copy(), "put")
-    merged  = calls_p.merge(puts_p, on=["timestamp", "_strike"], how="outer")
-    merged  = merged.rename(columns={"_strike": "strike", "underlyingPrice": "spot"})
+    calls_p = pivot_side(
+        df_all[df_all["_optType"] == "C"].copy(), "call")
+    puts_p  = pivot_side(
+        df_all[df_all["_optType"] == "P"].copy(), "put")
+    merged  = calls_p.merge(puts_p, on=["timestamp", "_strike"],
+                             how="outer")
+    merged  = merged.rename(
+        columns={"_strike": "strike", "underlyingPrice": "spot"})
     return merged.sort_values(["timestamp", "strike"]).reset_index(drop=True)
 
 # ─────────────────────────────────────────────────────────────
-# RESAMPLE wide_df to custom minute interval
-# ─────────────────────────────────────────────────────────────
-def resample_wide(wide_df, interval_minutes):
-    if interval_minutes <= 1:
-        return wide_df.copy()
-
-    df = wide_df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-    freq = f"{interval_minutes}min"
-    df["timestamp"] = df["timestamp"].dt.floor(freq)
-
-    greek_cols  = [c for c in df.columns
-                   if c not in ["timestamp","strike","spot"] and
-                   not c.endswith("_volume") and not c.endswith("_oi")]
-    volume_cols = [c for c in df.columns if c.endswith("_volume")]
-    oi_cols     = [c for c in df.columns if c.endswith("_oi")]
-
-    agg = {}
-    for c in greek_cols:
-        agg[c] = "mean"
-    for c in volume_cols:
-        agg[c] = "sum"
-    for c in oi_cols:
-        agg[c] = "max"
-    if "spot" in df.columns:
-        agg["spot"] = "mean"
-
-    resampled = (df.groupby(["timestamp", "strike"])
-                   .agg(agg)
-                   .reset_index()
-                   .sort_values(["timestamp", "strike"])
-                   .reset_index(drop=True))
-    return resampled
-
-# ─────────────────────────────────────────────────────────────
 # FORMULA ENGINE
-#
-# Four GEX formulas:
-#
-#   GEX_unsigned  — raw gamma exposure, both legs additive.
-#                   GEX magnitude at each strike regardless of
-#                   call/put dominance. Used for MVC ranking.
-#
-#   GEX_signed    — calls minus puts. Positive = call-dominated
-#                   (ceiling / resistance). Negative = put-dominated
-#                   (floor / support). Sign indicates structural role
-#                   of the strike.
-#
-#   GEX_agg_oi    — same as GEX_signed but aggregated across all
-#                   fetched strikes using OI weighting. Positive
-#                   aggregate → pinning regime. Negative → trending.
-#                   Scalar stored in a separate summary row.
-#
-#   GEX_dealer_sp — dealer-short-puts assumption applied explicitly.
-#                   Dealers short BOTH calls and puts (sold to retail).
-#                   Net dealer gamma = -(call_gamma*call_oi +
-#                   put_gamma*put_oi) × multiplier × S².
-#                   Negative = dealers net short gamma at this strike
-#                   (magnitude indicates hedging pressure).
-#                   The sign here is always negative so what matters
-#                   is the MAGNITUDE: larger absolute value = more
-#                   hedging activity = stronger attractor.
-#
-# One DEX formula:
-#
-#   DEX           — (call_delta × call_oi + put_delta × put_oi)
-#                   × multiplier × S.
-#                   Put delta is naturally negative from BSM so put
-#                   leg subtracts automatically.
-#                   Positive DEX → calls dominate → dealers net short
-#                   delta → buy pressure as price approaches.
-#                   Negative DEX → puts dominate → dealers net long
-#                   delta → sell pressure / support from put hedging.
-#
-# All dollar values divided by 1e9 → output in $B for readability.
 # ─────────────────────────────────────────────────────────────
 def apply_formulas(df, spot_override, intra_date):
     out = df.copy()
 
     spot_col = (out["spot"].fillna(spot_override)
                 if "spot" in out.columns
-                else pd.Series([spot_override] * len(out), index=out.index))
+                else pd.Series([spot_override] * len(out),
+                               index=out.index))
     out["spot_used"] = spot_col
 
     def col(name):
-        return out.get(name, pd.Series(0.0, index=out.index)).fillna(0)
+        return out.get(name,
+                       pd.Series(0.0, index=out.index)).fillna(0)
 
-    cg  = col("call_gamma")
-    pg  = col("put_gamma")
-    coi = col("call_oi")
-    poi = col("put_oi")
-    cd  = col("call_delta")
-    pd_ = col("put_delta")   # naturally negative from BSM
+    cg  = col("call_gamma");  pg  = col("put_gamma")
+    coi = col("call_oi");     poi = col("put_oi")
+    cd  = col("call_delta");  pd_ = col("put_delta")
 
     S  = spot_col
     S2 = S ** 2
     M  = SPX_MULT
 
-    # ── GEX_unsigned ──────────────────────────────────────────
-    # Both legs add. Gamma is always positive (BSM), so this gives
-    # the total magnitude of dealer hedging required at this strike.
-    # Use this to rank strikes and find the MVC.
     out["GEX_unsigned"]   = (cg * coi + pg * poi) * M * S2
     out["GEX_unsigned_$"] = out["GEX_unsigned"] / 1e9
 
-    # ── GEX_signed ────────────────────────────────────────────
-    # Calls minus puts. Positive = call gamma dominates = strike
-    # acts as ceiling (dealers sell into rally). Negative = put
-    # gamma dominates = strike acts as floor (dealers buy dip).
     out["GEX_signed"]   = (cg * coi - pg * poi) * M * S2
     out["GEX_signed_$"] = out["GEX_signed"] / 1e9
 
-    # ── GEX_agg_oi ────────────────────────────────────────────
-    # Aggregate GEX_signed across ALL fetched strikes using OI as
-    # weight. Scalar per timestamp (same value repeated in column
-    # for easy display alongside per-strike rows).
-    # Positive sum → positive gamma regime → pinning expected.
-    # Negative sum → negative gamma regime → trending expected.
     if "timestamp" in out.columns:
         agg_map = (out.groupby("timestamp")["GEX_signed"]
-                      .sum()
-                      .rename("GEX_agg_oi"))
+                      .sum().rename("GEX_agg_oi"))
         out = out.merge(agg_map, on="timestamp", how="left")
     else:
         out["GEX_agg_oi"] = out["GEX_signed"].sum()
     out["GEX_agg_oi_$"] = out["GEX_agg_oi"] / 1e9
 
-    # ── GEX_dealer_sp ─────────────────────────────────────────
-    # Dealer-short-puts assumption made explicit.
-    # Dealers are short gamma on BOTH sides (they sold calls AND
-    # puts to retail). Their net gamma = negative of total gamma.
-    # Formula: -(call_gamma×call_oi + put_gamma×put_oi) × M × S²
-    # Result is always ≤ 0 by construction. Magnitude = hedging
-    # pressure. Largest absolute value = strongest attractor strike.
-    # Separately computed so you can compare against GEX_unsigned
-    # (which has the same magnitude but positive sign) and decide
-    # which framing fits your visual better.
     out["GEX_dealer_sp"]   = -(cg * coi + pg * poi) * M * S2
     out["GEX_dealer_sp_$"] = out["GEX_dealer_sp"] / 1e9
 
-    # ── DEX ───────────────────────────────────────────────────
-    # Delta exposure in dollars.
-    # put_delta is negative → put term naturally subtracts.
-    # Positive DEX → calls dominate → bullish attractor.
-    # Negative DEX → puts dominate → bearish attractor / floor.
     out["DEX"]   = (cd * coi + pd_ * poi) * M * S
     out["DEX_$"] = out["DEX"] / 1e9
 
     return out
 
 # ─────────────────────────────────────────────────────────────
-# SNAPSHOT
+# BUILD FULL MINUTE-BY-MINUTE TIME SERIES (pre-computed)
+# Returns dict: { timestamp_str -> { strike -> {gex_vals, dex_val, spot} } }
+# Also returns sorted list of timestamps and list of strikes
 # ─────────────────────────────────────────────────────────────
-def get_snapshot(wide_df, target_et_full):
-    snap = (wide_df[wide_df["timestamp"] <= pd.Timestamp(target_et_full)]
-            .sort_values("timestamp")
-            .groupby("strike").last()
-            .reset_index())
-    return snap
+def build_minute_series(wide_df, spot_override, intra_date):
+    result = apply_formulas(wide_df, spot_override, intra_date)
+
+    gex_cols = ["GEX_unsigned_$", "GEX_signed_$",
+                "GEX_agg_oi_$",   "GEX_dealer_sp_$"]
+    dex_col  = "DEX_$"
+
+    # Build nested dict keyed by timestamp then strike
+    ts_groups = result.groupby("timestamp")
+    series = {}
+    for ts, grp in ts_groups:
+        ts_key = pd.Timestamp(ts).strftime("%H:%M")
+        strikes_data = {}
+        for _, row in grp.iterrows():
+            sk = int(row["strike"])
+            strikes_data[sk] = {
+                "GEX_unsigned": float(row.get("GEX_unsigned_$", 0) or 0),
+                "GEX_signed":   float(row.get("GEX_signed_$",   0) or 0),
+                "GEX_agg_oi":   float(row.get("GEX_agg_oi_$",   0) or 0),
+                "GEX_dealer_sp":float(row.get("GEX_dealer_sp_$",0) or 0),
+                "DEX":          float(row.get(dex_col,           0) or 0),
+                "spot":         float(row.get("spot_used",
+                                              spot_override) or spot_override),
+            }
+        series[ts_key] = strikes_data
+
+    sorted_ts = sorted(series.keys())
+
+    # All strikes present across all timestamps
+    all_strikes = sorted(set(
+        sk for ts_data in series.values()
+        for sk in ts_data.keys()))
+
+    return series, sorted_ts, all_strikes
 
 # ─────────────────────────────────────────────────────────────
-# BUILD FULL SESSION TIME SERIES
+# BUILD FULL SESSION TABLE (for data tabs)
 # ─────────────────────────────────────────────────────────────
-def build_session_timeseries(wide_df, spot_override, intra_date, interval_minutes):
-    resampled = resample_wide(wide_df, interval_minutes)
-    result    = apply_formulas(resampled, spot_override, intra_date)
+def build_session_table(wide_df, spot_override, intra_date):
+    result = apply_formulas(wide_df, spot_override, intra_date)
 
-    greek_cols  = ["call_iv","call_delta","call_gamma","call_vanna","call_charm",
-                   "call_oi","call_volume",
-                   "put_iv","put_delta","put_gamma","put_vanna","put_charm",
-                   "put_oi","put_volume"]
+    greek_cols   = ["call_iv","call_delta","call_gamma","call_vanna",
+                    "call_charm","call_oi","call_volume",
+                    "put_iv","put_delta","put_gamma","put_vanna",
+                    "put_charm","put_oi","put_volume"]
     formula_cols = [c for c in result.columns if c.endswith("_$")]
 
     keep = (["timestamp","strike","spot_used"] +
-              [c for c in greek_cols   if c in result.columns] +
+            [c for c in greek_cols   if c in result.columns] +
             [c for c in formula_cols if c in result.columns])
 
     ts_df = result[[c for c in keep if c in result.columns]].copy()
     ts_df = ts_df.rename(columns={"spot_used": "spot"})
     ts_df = ts_df.sort_values(["timestamp","strike"]).reset_index(drop=True)
-    ts_df.rename(columns={c: c.replace("_$", " ($)") for c in formula_cols
-                           if c in ts_df.columns}, inplace=True)
+    ts_df.rename(
+        columns={c: c.replace("_$", " ($)")
+                 for c in formula_cols if c in ts_df.columns},
+        inplace=True)
     return ts_df
 
 # ─────────────────────────────────────────────────────────────
-# FORMAT HELPERS
+# CHART BUILDER — lightweight-charts histogram
+# series_data: list of {strike, value} dicts
+# spot: float — current spot price for the price line label
+# title: str
 # ─────────────────────────────────────────────────────────────
-def fmt_b(val):
-    if pd.isna(val) or val is None: return "N/A"
-    v = float(val)
-    if abs(v) >= 1e9: return f"${v/1e9:.2f}B"
-    if abs(v) >= 1e6: return f"${v/1e6:.2f}M"
-    if abs(v) >= 1e3: return f"${v/1e3:.1f}K"
-    return f"${v:.2f}"
-
-def fmt_df_dollars(df):
-    out = df.copy()
-    for c in out.columns:
-        if "($)" in c:
-            out[c] = out[c].apply(fmt_b)
-    return out
-
-# ─────────────────────────────────────────────────────────────
-# DISPLAY
-# ─────────────────────────────────────────────────────────────
-def display_results(snap_df, ts_df, spot_actual, date_str,
-                    et_label, interval_minutes):
-
-    st.subheader(f"Snapshot — {date_str}  |  {et_label}")
-    c1, c2 = st.columns(2)
-    c1.metric("Spot at Snapshot", f"{spot_actual:.2f}" if spot_actual else "N/A")
-    c2.metric("Strikes in Snapshot", len(snap_df))
-    st.divider()
-
-    # ── GEX snapshot ──────────────────────────────────────────
-    st.subheader("GEX Per Strike — Snapshot")
-    st.caption(
-        "GEX_unsigned: total gamma magnitude (use for MVC ranking)  |  "
-        "GEX_signed: calls − puts (+ = ceiling, − = floor)  |  "
-        "GEX_agg_oi: regime scalar aggregated across all fetched strikes  |  "
-        "GEX_dealer_sp: signed with dealer-short-puts assumption (always ≤ 0, magnitude = hedging pressure)"
-    )
-    gex_cols = (["strike"] +
-                [c for c in snap_df.columns
-                 if c.startswith("GEX") and c.endswith("_$")])
-    gex_df   = snap_df[[c for c in gex_cols if c in snap_df.columns]].copy()
-    gex_df.rename(columns={c: c.replace("_$", " ($)") for c in gex_df.columns
-                            if c.endswith("_$")}, inplace=True)
-    st.dataframe(fmt_df_dollars(gex_df), use_container_width=True, hide_index=True)
-
-    # ── DEX snapshot ──────────────────────────────────────────
-    st.subheader("DEX Per Strike — Snapshot")
-    st.caption(
-        "DEX = (call_delta × call_OI + put_delta × put_OI) × 100 × S  |  "
-        "Positive = calls dominate (bullish attractor)  |  "
-        "Negative = puts dominate (bearish attractor / floor)"
-    )
-    dex_cols = (["strike"] +
-                [c for c in snap_df.columns
-                 if c.startswith("DEX") and c.endswith("_$")])
-    dex_df   = snap_df[[c for c in dex_cols if c in snap_df.columns]].copy()
-    dex_df.rename(columns={c: c.replace("_$", " ($)") for c in dex_df.columns
-                            if c.endswith("_$")}, inplace=True)
-    st.dataframe(fmt_df_dollars(dex_df), use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # ── Full session time series ───────────────────────────────
-    st.subheader(
-        f"Full Session Time Series — Greeks + GEX + DEX  "
-        f"({interval_minutes}-min bars, all strikes)"
-    )
-    st.caption(
-        "Columns: timestamp · strike · spot · "
-        "call/put iv, delta, gamma, vanna, charm, oi, volume · "
-        "GEX_unsigned, GEX_signed, GEX_agg_oi, GEX_dealer_sp ($) · DEX ($)"
-    )
-
-    tab_greeks, tab_gex, tab_dex = st.tabs(["Greeks", "GEX", "DEX"])
-
-    greek_display = ["call_iv","call_delta","call_gamma","call_vanna","call_charm",
-                     "call_oi","call_volume",
-                     "put_iv","put_delta","put_gamma","put_vanna","put_charm",
-                     "put_oi","put_volume"]
-
-    with tab_greeks:
-        g_cols = (["timestamp","strike","spot"] +
-                  [c for c in greek_display if c in ts_df.columns])
-        st.dataframe(ts_df[[c for c in g_cols if c in ts_df.columns]],
-                     use_container_width=True, hide_index=True)
-
-    with tab_gex:
-        gex_ts_cols = (["timestamp","strike","spot"] +
-                       [c for c in ts_df.columns
-                        if c.startswith("GEX") and "($)" in c])
-        st.dataframe(fmt_df_dollars(ts_df[[c for c in gex_ts_cols if c in ts_df.columns]]),
-                     use_container_width=True, hide_index=True)
-
-    with tab_dex:
-        dex_ts_cols = (["timestamp","strike","spot"] +
-                       [c for c in ts_df.columns
-                        if c.startswith("DEX") and "($)" in c])
-        st.dataframe(fmt_df_dollars(ts_df[[c for c in dex_ts_cols if c in ts_df.columns]]),
-                     use_container_width=True, hide_index=True)
-
-# ─────────────────────────────────────────────────────────────
-# INPUT FORM — main page, no sidebar
-# ─────────────────────────────────────────────────────────────
-st.header("Parameters")
-
-with st.form("params_form"):
-    r1c1, r1c2 = st.columns(2)
-    api_key     = r1c1.text_input("iVolatility API Key", type="password",
-                                   placeholder="Paste your Backtest+ key")
-    minute_type = r1c2.selectbox("API Bar Interval (data resolution)",
-                                  ["MINUTE_1","MINUTE_5","MINUTE_15","MINUTE_30"])
-
-    r2c1, r2c2 = st.columns(2)
-    date_input  = r2c1.date_input("Date (EAT)", value=date.today())
-
-    r2c2.markdown("**Session Time (EAT)**")
-    t_col1, t_col2 = r2c2.columns(2)
-    eat_hour   = t_col1.number_input("Hour (0–23)", min_value=0, max_value=23,
-                                      value=17, step=1)
-    eat_minute = t_col2.number_input("Minute (0–59)", min_value=0, max_value=59,
-                                      value=30, step=1)
-
-    r3c1, r3c2, r3c3 = st.columns(3)
-    center_strike = r3c1.number_input("Center Strike",     value=5580, step=5)
-    num_strikes   = r3c2.number_input("Strikes Each Side", value=5,
-                                       min_value=1, max_value=20, step=1)
-    strike_step   = r3c3.number_input("Strike Step",       value=5, min_value=1, step=1)
-
-    r4c1, r4c2 = st.columns(2)
-    interval_minutes = r4c1.number_input(
-        "Display Interval (minutes) — resamples time series to this period",
-        min_value=1, max_value=390, value=5, step=1
-    )
-    spot_override = r4c2.number_input(
-        "Spot Override — fallback if API underlyingPrice missing",
-        value=float(center_strike), step=1.0
-    )
-
-    submitted = st.form_submit_button("🚀 Fetch & Calculate", use_container_width=True)
-
-# ─────────────────────────────────────────────────────────────
-# MAIN PIPELINE
-# ─────────────────────────────────────────────────────────────
-if submitted:
-    if not api_key:
-        st.error("Enter your iVolatility API key"); st.stop()
-
-    eat_time      = time(int(eat_hour), int(eat_minute))
-    date_str      = date_input.strftime("%Y-%m-%d")
-    prev_date_str = prev_trading_day(date_input).strftime("%Y-%m-%d")
-    exp_date_str  = date_str
-    et_dt, tz_str = eat_to_et(date_input, eat_time)
-    et_label      = f"{et_dt.strftime('%H:%M')} {tz_str}"
-    intra_date    = date_input
-
-    strike_min = int(center_strike) - int(num_strikes) * int(strike_step)
-    strike_max = int(center_strike) + int(num_strikes) * int(strike_step)
-    headers    = {"Authorization": f"Bearer {api_key}"}
-
-    st.info(
-        f"Date: {date_str}  |  OI source: {prev_date_str}  |  "
-        f"Snapshot: {et_label}  |  Strikes: {strike_min}–{strike_max} "
-        f"step {int(strike_step)}  |  Display interval: {int(interval_minutes)}min"
-    )
-
-    # Step 1
-    with st.spinner("Step 1 / 3 — Fetching option series..."):
-        calls_series, puts_series = get_option_ids(
-            api_key, headers, prev_date_str, exp_date_str, strike_min, strike_max)
-    if calls_series is None: st.stop()
-    st.success(f"Step 1 ✅ — Calls: {len(calls_series)}  Puts: {len(puts_series)}")
-
-    # Step 2
-    with st.spinner("Step 2 / 3 — Fetching EOD OI..."):
-        oi_map = get_eod_oi(api_key, headers, calls_series, puts_series, prev_date_str)
-    filled = sum(1 for v in oi_map.values() if v > 0)
-    st.success(f"Step 2 ✅ — OI entries: {filled}/{len(oi_map)} non-zero")
-
-    # Step 3
-    st.write("Step 3 / 3 — Fetching intraday Greeks...")
-    progress = st.progress(0, text="Starting...")
-    df_all = get_intraday_greeks(
-        api_key, date_str, exp_date_str,
-        strike_min, strike_max, strike_step,
-        minute_type, oi_map, progress)
-    progress.empty()
-    if df_all is None:
-        st.error("No intraday data returned"); st.stop()
-    st.success(f"Step 3 ✅ — {len(df_all):,} intraday rows")
-
-    # Pivot
-    with st.spinner("Building wide table..."):
-        wide_df = pivot_wide(df_all)
-
-    # Snapshot
-    target_et_full = datetime.combine(intra_date, et_dt.time())
-    snap_raw  = get_snapshot(wide_df, target_et_full)
-
-    if snap_raw.empty:
-        st.error("No bars at or before the requested time — try a later EAT time")
-        st.stop()
-
-    snap_calc = apply_formulas(snap_raw, spot_override, intra_date)
-
-    # Full session time series
-    with st.spinner(f"Building {int(interval_minutes)}-min session time series..."):
-        ts_df = build_session_timeseries(
-            wide_df, spot_override, intra_date, int(interval_minutes))
-
-    spot_actual = (snap_calc["spot_used"].median()
-                   if "spot_used" in snap_calc.columns else spot_override)
-
-    display_results(snap_calc, ts_df, spot_actual,
-                    date_str, et_label, int(interval_minutes))
-   
+def build_histogram_chart(series_data, spot, title):
+    """
+    Renders a histogram chart using streamlit-lightweight-charts.
+    X-axis = strike (treated as 'time' — we use integer strikes
+    mapped to the time field as Unix-
