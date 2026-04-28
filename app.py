@@ -515,7 +515,7 @@ def build_histogram_chart(series_data, spot, title):
     max_abs_js = round(max_abs, 6)
     title_escaped = title.replace("'", "\\'")
 
-    html = f"""
+    html = f'''
 <!DOCTYPE html>
 <html>
 <head>
@@ -802,7 +802,7 @@ chartInner.style.minWidth = (totalW + 60) + 'px';
 </script>
 </body>
 </html>
-"""
+'''
 
     # Height: 320px chart + title + spot info + x-label overflow
     components.html(html, height=400, scrolling=False)
