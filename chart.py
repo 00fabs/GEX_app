@@ -12,7 +12,7 @@ import streamlit.components.v1 as components
 
 
 def build_histogram_chart(series_data: list, spot: float, title: str):
-    '''
+    """
     Parameters
     ----------
     series_data : list of {"strike": int, "value": float}
@@ -657,6 +657,6 @@ window.addEventListener('resize', () => {{
 resize();
 </script>
 </body>
-</html>'''
+</html>"""
 
     components.html(html, height=460, scrolling=False)
