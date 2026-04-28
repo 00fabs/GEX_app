@@ -519,4 +519,603 @@ def build_histogram_chart(series_data, spot, title):
 <!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=devi
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: #0e1117;
+    color: #d1d4dc;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    overflow-x: hidden;
+  }}
+  .chart-title {{
+    padding: 8px 10px 4px;
+    font-size: 13px;
+    font-weight: 600;
+    color: #e0e0e0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .chart-wrapper {{
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    cursor: grab;
+    background: #0e1117;
+    border: 1px solid #1e2130;
+    border-radius: 6px;
+  }}
+  .chart-wrapper:active {{ cursor: grabbing; }}
+  .chart-inner {{
+    position: relative;
+    height: 320px;
+    padding: 10px 8px 36px 52px;
+  }}
+  .y-axis {{
+    position: absolute;
+    left: 0; top: 10px; bottom: 36px;
+    width: 52px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: flex-end;
+    padding-right: 6px;
+  }}
+  .y-label {{
+    font-size: 10px;
+    color: #666;
+    line-height: 1;
+  }}
+  .bars-area {{
+    position: relative;
+    height: 100%;
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+  }}
+  .zero-line {{
+    position: absolute;
+    left: 0; right: 0;
+    height: 1px;
+    background: #ffffff44;
+    pointer-events: none;
+    z-index: 2;
+  }}
+  .bar-col {{
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+    flex-shrink: 0;
+    width: 22px;
+  }}
+  .bar-col.spot-col .bar-rect {{
+    outline: 2px solid #f0c040;
+    outline-offset: 1px;
+  }}
+  .bar-rect {{
+    width: 18px;
+    border-radius: 2px 2px 0 0;
+    transition: opacity 0.1s;
+    cursor: pointer;
+    position: relative;
+    z-index: 3;
+  }}
+  .bar-rect.negative {{
+    border-radius: 0 0 2px 2px;
+  }}
+  .bar-rect:hover {{ opacity: 0.75; }}
+  .x-label {{
+    position: absolute;
+    bottom: -22px;
+    font-size: 9px;
+    color: #888;
+    white-space: nowrap;
+    transform: rotate(-45deg);
+    transform-origin: top left;
+    left: 2px;
+  }}
+  .x-label.spot-label {{ color: #f0c040; font-weight: 700; }}
+  .tooltip {{
+    position: fixed;
+    background: #1e2130ee;
+    border: 1px solid #444;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+    pointer-events: none;
+    z-index: 9999;
+    display: none;
+    min-width: 140px;
+    box-shadow: 0 4px 16px #0008;
+  }}
+  .tooltip .t-strike {{ font-weight: 700; color: #26a69a; font-size: 14px; }}
+  .tooltip .t-val {{ color: #f0c040; }}
+  .tooltip .t-spot {{ color: #aaa; font-size: 11px; margin-top: 3px; }}
+  .spot-info {{
+    padding: 6px 10px 8px;
+    color: #f0c040;
+    font-size: 12px;
+  }}
+  .grid-line {{
+    position: absolute;
+    left: 0; right: 0;
+    height: 1px;
+    background: #1e2130;
+    pointer-events: none;
+    z-index: 1;
+  }}
+</style>
+</head>
+<body>
+<div class="chart-title">{title_escaped}</div>
+<div id="tooltip" class="tooltip">
+  <div class="t-strike" id="tt-strike"></div>
+  <div class="t-val" id="tt-val"></div>
+  <div class="t-spot" id="tt-spot"></div>
+</div>
+<div class="chart-wrapper">
+  <div class="chart-inner" id="chartInner">
+    <div class="y-axis" id="yAxis"></div>
+    <div class="bars-area" id="barsArea"></div>
+  </div>
+</div>
+<div class="spot-info">▲ Spot: <b>{spot_js}</b> &nbsp;|&nbsp; Nearest strike: <b>{spot_strike_js}</b></div>
+
+<script>
+const strikes   = {strikes_js};
+const values    = {values_js};
+const spotIdx   = {spot_idx_js};
+const spot      = {spot_js};
+const maxAbs    = {max_abs_js};
+const spotStrike = {spot_strike_js};
+
+const barsArea  = document.getElementById('barsArea');
+const chartInner = document.getElementById('chartInner');
+const yAxis     = document.getElementById('yAxis');
+const tooltip   = document.getElementById('tooltip');
+const ttStrike  = document.getElementById('tt-strike');
+const ttVal     = document.getElementById('tt-val');
+const ttSpot    = document.getElementById('tt-spot');
+
+// Chart height available for bars (px), excluding padding
+const CHART_H = 274;  // 320 - 10top - 36bottom
+
+// Draw Y-axis labels
+const numTicks = 5;
+const yLabels = [];
+for (let i = 0; i <= numTicks; i++) {{
+  const frac = i / numTicks;
+  const val  = maxAbs - frac * 2 * maxAbs;
+  yLabels.push(val);
+}}
+yAxis.innerHTML = yLabels.map(v => {{
+  const sign = v >= 0 ? '+' : '';
+  const disp = Math.abs(v) >= 1 ? v.toFixed(2) : v.toFixed(3);
+  return `<span class="y-label">${{sign}}${{disp}}B</span>`;
+}}).join('');
+
+// Grid lines
+for (let i = 0; i <= numTicks; i++) {{
+  const pct = i / numTicks * 100;
+  const gl  = document.createElement('div');
+  gl.className = 'grid-line';
+  gl.style.top = pct + '%';
+  barsArea.appendChild(gl);
+}}
+
+// Zero line: sits at 50% height (midpoint between maxAbs and -maxAbs)
+const zeroLine = document.createElement('div');
+zeroLine.className = 'zero-line';
+zeroLine.style.top = '50%';
+barsArea.appendChild(zeroLine);
+
+// Min width so all bars fit; allow horizontal scroll on mobile
+const barW   = 22;
+const gapW   = 2;
+const totalW = strikes.length * (barW + gapW);
+barsArea.style.minWidth = totalW + 'px';
+barsArea.style.height   = CHART_H + 'px';
+barsArea.style.position = 'relative';
+barsArea.style.alignItems = 'unset';
+
+// Draw bars
+strikes.forEach((strike, i) => {{
+  const val    = values[i];
+  const isPos  = val >= 0;
+  const color  = isPos ? '#26a69a' : '#ef5350';
+  const pct    = Math.abs(val) / maxAbs;   // 0..1
+
+  // Bar height in px: max is half chart height (50% = one side)
+  const barH   = Math.round(pct * (CHART_H / 2));
+  // Zero line is at CHART_H/2 from top
+  const zeroY  = CHART_H / 2;
+
+  const col    = document.createElement('div');
+  col.className = 'bar-col' + (i === spotIdx ? ' spot-col' : '');
+  col.style.position = 'absolute';
+  col.style.left     = (i * (barW + gapW)) + 'px';
+  col.style.bottom   = '0';
+  col.style.height   = CHART_H + 'px';
+  col.style.width    = barW + 'px';
+
+  const rect   = document.createElement('div');
+  rect.className = 'bar-rect' + (isPos ? '' : ' negative');
+  rect.style.background = color;
+  rect.style.width      = '18px';
+  rect.style.height     = barH + 'px';
+  rect.style.position   = 'absolute';
+
+  if (isPos) {{
+    // Positive bar: grows upward from zero line
+    rect.style.bottom = (CHART_H / 2) + 'px';
+    rect.style.top    = 'auto';
+  }} else {{
+    // Negative bar: grows downward from zero line
+    rect.style.top  = (CHART_H / 2) + 'px';
+    rect.style.bottom = 'auto';
+  }}
+
+  // X label (every 2nd or every label depending on count)
+  const showLabel = strikes.length <= 40 || i % 2 === 0;
+  if (showLabel) {{
+    const lbl = document.createElement('div');
+    lbl.className = 'x-label' + (i === spotIdx ? ' spot-label' : '');
+    lbl.textContent = strike;
+    lbl.style.position = 'absolute';
+    lbl.style.bottom   = '-24px';
+    lbl.style.left     = '2px';
+    col.appendChild(lbl);
+  }}
+
+  // Tooltip on tap/hover
+  function showTip(e) {{
+    const sign = val >= 0 ? '+' : '';
+    ttStrike.textContent = 'Strike: ' + strike;
+    ttVal.textContent    = sign + val.toFixed(4) + 'B';
+    ttSpot.textContent   = 'Spot: ' + spot + (i === spotIdx ? '  ◀ ATM' : '');
+    tooltip.style.display = 'block';
+    moveTip(e);
+  }}
+  function moveTip(e) {{
+    const src = e.touches ? e.touches[0] : e;
+    tooltip.style.left = (src.clientX + 14) + 'px';
+    tooltip.style.top  = (src.clientY - 40) + 'px';
+  }}
+  function hideTip() {{ tooltip.style.display = 'none'; }}
+
+  rect.addEventListener('mouseenter', showTip);
+  rect.addEventListener('mousemove',  moveTip);
+  rect.addEventListener('mouseleave', hideTip);
+  rect.addEventListener('touchstart', e => {{ showTip(e); e.preventDefault(); }}, {{passive:false}});
+  rect.addEventListener('touchmove',  moveTip, {{passive:true}});
+  rect.addEventListener('touchend',   hideTip);
+
+  col.appendChild(rect);
+  barsArea.appendChild(col);
+}});
+
+// Set chart-inner min-width to match
+chartInner.style.minWidth = (totalW + 60) + 'px';
+</script>
+</body>
+</html>
+"""
+
+    # Height: 320px chart + title + spot info + x-label overflow
+    components.html(html, height=400, scrolling=False)
+
+# ─────────────────────────────────────────────────────────────
+# FORMAT HELPERS
+# ─────────────────────────────────────────────────────────────
+def fmt_b(val):
+    if pd.isna(val) or val is None: return "N/A"
+    v = float(val)
+    if abs(v) >= 1e9: return f"${v/1e9:.2f}B"
+    if abs(v) >= 1e6: return f"${v/1e6:.2f}M"
+    if abs(v) >= 1e3: return f"${v/1e3:.1f}K"
+    return f"${v:.2f}"
+
+def fmt_df_dollars(df):
+    out = df.copy()
+    for c in out.columns:
+        if "($)" in c:
+            out[c] = out[c].apply(fmt_b)
+    return out
+
+# ─────────────────────────────────────────────────────────────
+# SESSION STATE INIT
+# ─────────────────────────────────────────────────────────────
+def init_state():
+    defaults = {
+        "computed":        False,
+        "minute_series":   {},
+        "sorted_ts":       [],
+        "all_strikes":     [],
+        "ts_index":        0,
+        "step_size":       1,
+        "ts_table":        None,
+        "date_str":        "",
+        "spot_override":   5500.0,
+        "intra_date":      None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
+
+# ─────────────────────────────────────────────────────────────
+# GREEN RADIO STYLE
+# ─────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+div[data-testid="stRadio"] label { cursor: pointer; }
+div[data-testid="stRadio"] input[type="radio"]:checked + div > div {
+    background-color: #26a69a !important;
+    border-color:     #26a69a !important;
+}
+div[data-testid="stRadio"] label:hover span { color: #26a69a; }
+</style>
+""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────────────────────────
+# INPUT FORM
+# ─────────────────────────────────────────────────────────────
+st.header("Parameters")
+
+with st.form("params_form"):
+    c1, c2, c3 = st.columns(3)
+
+    api_key     = c1.text_input(
+        "iVolatility API Key", type="password",
+        placeholder="Paste your Backtest+ key")
+
+    date_input  = c2.date_input("Session Date", value=date.today())
+
+    minute_type = c3.selectbox(
+        "API Bar Resolution",
+        ["MINUTE_1","MINUTE_5","MINUTE_15","MINUTE_30"],
+        help="MINUTE_1 gives the finest granularity for stepping.")
+
+    c4, c5 = st.columns(2)
+    rough_center  = c4.number_input(
+        "Rough ATM Strike (pilot fetch only)",
+        value=5580, step=5,
+        help="Used for the pilot fetch to establish session high/low.")
+    spot_override_input = c5.number_input(
+        "Spot Override (fallback if API missing)",
+        value=5580.0, step=1.0)
+
+    submitted = st.form_submit_button(
+        "🚀 Fetch & Compute Full Session", use_container_width=True)
+
+# ─────────────────────────────────────────────────────────────
+# MAIN PIPELINE
+# ─────────────────────────────────────────────────────────────
+if submitted:
+    if not api_key:
+        st.error("Enter your iVolatility API key"); st.stop()
+
+    date_str      = date_input.strftime("%Y-%m-%d")
+    prev_date_str = prev_trading_day(date_input).strftime("%Y-%m-%d")
+    exp_date_str  = date_str
+    headers       = {"Authorization": f"Bearer {api_key}"}
+
+    st.session_state["computed"]      = False
+    st.session_state["date_str"]      = date_str
+    st.session_state["spot_override"] = spot_override_input
+    st.session_state["intra_date"]    = date_input
+    st.session_state["ts_index"]      = 0
+
+    with st.spinner("Pilot fetch — establishing session price range..."):
+        lo, hi = get_session_price_range(
+            api_key, date_str, exp_date_str,
+            rough_center, minute_type)
+
+    if lo is None or hi is None:
+        st.error("Pilot fetch failed — check API key and date.")
+        st.stop()
+
+    strike_min = (int(lo // STRIKE_STEP) * STRIKE_STEP - 5 * STRIKE_STEP)
+    strike_max = (int(hi // STRIKE_STEP) * STRIKE_STEP + STRIKE_STEP + 5 * STRIKE_STEP)
+
+    st.info(
+        f"Date: {date_str}  |  Session range: {lo:.1f} – {hi:.1f}  |  "
+        f"Fetching strikes: {strike_min} – {strike_max} "
+        f"(step {STRIKE_STEP})")
+
+    with st.spinner("Step 1 / 3 — Option series..."):
+        calls_series, puts_series = get_option_ids(
+            api_key, headers, prev_date_str, exp_date_str,
+            strike_min, strike_max)
+    if calls_series is None: st.stop()
+    st.success(
+        f"Step 1 ✅ — Calls: {len(calls_series)}  "
+        f"Puts: {len(puts_series)}")
+
+    with st.spinner("Step 2 / 3 — EOD OI..."):
+        oi_map = get_eod_oi(
+            api_key, headers, calls_series,
+            puts_series, prev_date_str)
+    filled = sum(1 for v in oi_map.values() if v > 0)
+    st.success(
+        f"Step 2 ✅ — OI entries: {filled}/{len(oi_map)} non-zero")
+
+    st.write("Step 3 / 3 — Intraday Greeks (full session)...")
+    progress = st.progress(0, text="Starting...")
+    df_all = get_intraday_greeks(
+        api_key, date_str, exp_date_str,
+        strike_min, strike_max,
+        minute_type, oi_map, progress)
+    progress.empty()
+    if df_all is None:
+        st.error("No intraday data returned"); st.stop()
+    st.success(f"Step 3 ✅ — {len(df_all):,} intraday rows")
+
+    with st.spinner("Computing GEX / DEX for full session..."):
+        wide_df = pivot_wide(df_all)
+        minute_series, sorted_ts, all_strikes = build_minute_series(
+            wide_df, spot_override_input, date_input)
+        ts_table = build_session_table(
+            wide_df, spot_override_input, date_input)
+
+    st.session_state["minute_series"] = minute_series
+    st.session_state["sorted_ts"]     = sorted_ts
+    st.session_state["all_strikes"]   = all_strikes
+    st.session_state["ts_table"]      = ts_table
+    st.session_state["ts_index"]      = 0
+    st.session_state["computed"]      = True
+    st.success("✅ All data computed. Use the controls below to step through the session.")
+
+# ─────────────────────────────────────────────────────────────
+# VISUALIZATION SECTION
+# ─────────────────────────────────────────────────────────────
+if st.session_state["computed"]:
+
+    minute_series = st.session_state["minute_series"]
+    sorted_ts     = st.session_state["sorted_ts"]
+    all_strikes   = st.session_state["all_strikes"]
+    ts_table      = st.session_state["ts_table"]
+    date_str      = st.session_state["date_str"]
+    spot_override = st.session_state["spot_override"]
+    intra_date    = st.session_state["intra_date"]
+
+    st.divider()
+    st.header("📊 GEX / DEX Charts")
+
+    ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4, ctrl_col5 = \
+        st.columns([1, 1, 2, 1, 2])
+
+    with ctrl_col1:
+        if st.button("◀  Prev", use_container_width=True):
+            step = st.session_state["step_size"]
+            st.session_state["ts_index"] = max(
+                0, st.session_state["ts_index"] - step)
+
+    with ctrl_col2:
+        if st.button("Next  ▶", use_container_width=True):
+            step = st.session_state["step_size"]
+            st.session_state["ts_index"] = min(
+                len(sorted_ts) - 1,
+                st.session_state["ts_index"] + step)
+
+    with ctrl_col3:
+        step_options = [1, 2, 5, 10, 15, 30]
+        chosen_step  = st.selectbox(
+            "Step size (bars)",
+            options=step_options,
+            index=step_options.index(st.session_state["step_size"])
+                  if st.session_state["step_size"] in step_options
+                  else 0,
+            label_visibility="collapsed")
+        st.session_state["step_size"] = chosen_step
+
+    with ctrl_col4:
+        if st.button("⏮ First", use_container_width=True):
+            st.session_state["ts_index"] = 0
+
+    with ctrl_col5:
+        ts_idx = st.slider(
+            "Jump to bar",
+            min_value=0,
+            max_value=max(len(sorted_ts) - 1, 0),
+            value=st.session_state["ts_index"],
+            label_visibility="collapsed")
+        if ts_idx != st.session_state["ts_index"]:
+            st.session_state["ts_index"] = ts_idx
+
+    current_idx  = st.session_state["ts_index"]
+    current_ts   = sorted_ts[current_idx]
+    ts_data      = minute_series.get(current_ts, {})
+
+    spots_at_ts  = [v["spot"] for v in ts_data.values() if v["spot"] > 0]
+    current_spot = np.mean(spots_at_ts) if spots_at_ts else spot_override
+
+    et_time = datetime.strptime(current_ts, "%H:%M").time()
+    et_dt   = datetime.combine(
+        intra_date if intra_date else date.today(), et_time)
+    eat_dt  = et_to_eat(et_dt, intra_date if intra_date else date.today())
+
+    st.markdown(
+        f"### Bar: &nbsp; "
+        f"<span style='color:#26a69a'>{current_ts} ET</span> &nbsp;|&nbsp; "
+        f"<span style='color:#aaa'>{eat_dt.strftime('%H:%M')} EAT</span> &nbsp;|&nbsp; "
+        f"<span style='color:#f0c040'>Spot: {current_spot:.2f}</span> &nbsp;|&nbsp; "
+        f"Bar {current_idx + 1} / {len(sorted_ts)}",
+        unsafe_allow_html=True)
+
+    toggle_col1, toggle_col2 = st.columns(2)
+
+    with toggle_col1:
+        chart_type = st.radio(
+            "Chart",
+            ["GEX", "DEX"],
+            horizontal=True,
+            key="chart_type_radio")
+
+    with toggle_col2:
+        gex_formula = st.radio(
+            "GEX Formula",
+            ["GEX_unsigned", "GEX_signed",
+             "GEX_agg_oi",   "GEX_dealer_sp"],
+            horizontal=True,
+            key="gex_formula_radio")
+
+    formula_key = (gex_formula if chart_type == "GEX" else "DEX")
+    chart_data  = []
+
+    for sk in all_strikes:
+        row = ts_data.get(sk, {})
+        val = row.get(formula_key, 0.0)
+        chart_data.append({"strike": sk, "value": val})
+
+    chart_title = (
+        f"{formula_key}  —  {date_str}  |  {current_ts} ET  |  "
+        f"Spot {current_spot:.2f}"
+        if chart_type == "GEX"
+        else f"DEX  —  {date_str}  |  {current_ts} ET  |  "
+             f"Spot {current_spot:.2f}")
+
+    build_histogram_chart(chart_data, current_spot, chart_title)
+
+    st.divider()
+
+    st.subheader("Full Session Data Tables")
+    tab_greeks, tab_gex, tab_dex = st.tabs(["Greeks", "GEX", "DEX"])
+
+    greek_display = ["call_iv","call_delta","call_gamma","call_vanna",
+                     "call_charm","call_oi","call_volume",
+                     "put_iv","put_delta","put_gamma","put_vanna",
+                     "put_charm","put_oi","put_volume"]
+
+    with tab_greeks:
+        g_cols = (["timestamp","strike","spot"] +
+                  [c for c in greek_display if c in ts_table.columns])
+        st.dataframe(
+            ts_table[[c for c in g_cols if c in ts_table.columns]],
+            use_container_width=True, hide_index=True)
+
+    with tab_gex:
+        gex_ts_cols = (
+            ["timestamp","strike","spot"] +
+            [c for c in ts_table.columns
+             if c.startswith("GEX") and "($)" in c])
+        st.dataframe(
+            fmt_df_dollars(
+                ts_table[[c for c in gex_ts_cols
+                          if c in ts_table.columns]]),
+            use_container_width=True, hide_index=True)
+
+    with tab_dex:
+        dex_ts_cols = (
+            ["timestamp","strike","spot"] +
+            [c for c in ts_table.columns
+             if c.startswith("DEX") and "($)" in c])
+        st.dataframe(
+            fmt_df_dollars(
+                ts_table[[c for c in dex_ts_cols
+                          if c in ts_table.columns]]),
+            use_container_width=True, hide_index=True)
