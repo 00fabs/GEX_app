@@ -265,7 +265,7 @@ def get_intraday_greeks(api_key, date_str, exp_date_str,
                 st.warning(f"Error {strike}{opt_type}: {e}")
 
     if not all_data: return None
-    combined             = pd.concat(all_data, ignore_index=True)
+    combined              = pd.concat(all_data, ignore_index=True)
     combined["timestamp"] = pd.to_datetime(combined["timestamp"])
     return combined[
         (combined["timestamp"].dt.time >= SESSION_START) &
@@ -304,11 +304,6 @@ def pivot_wide(df_all):
 
 # ─────────────────────────────────────────────────────────────
 # RESAMPLE wide_df to custom minute interval
-# Every bar is floored to the nearest N-minute bucket.
-# Greeks are averaged within each bucket (last value also valid
-# for delta/gamma but mean is safer for mixed-bar intervals).
-# OI is max within bucket (EOD static — max = the value itself).
-# Volume is summed (cumulative within bucket).
 # ─────────────────────────────────────────────────────────────
 def resample_wide(wide_df, interval_minutes):
     if interval_minutes <= 1:
@@ -317,11 +312,9 @@ def resample_wide(wide_df, interval_minutes):
     df = wide_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
 
-    # Floor timestamp to interval bucket
     freq = f"{interval_minutes}min"
     df["timestamp"] = df["timestamp"].dt.floor(freq)
 
-    # Separate volume (sum) and oi (max) from Greeks (mean)
     greek_cols  = [c for c in df.columns
                    if c not in ["timestamp","strike","spot"] and
                    not c.endswith("_volume") and not c.endswith("_oi")]
@@ -347,6 +340,45 @@ def resample_wide(wide_df, interval_minutes):
 
 # ─────────────────────────────────────────────────────────────
 # FORMULA ENGINE
+#
+# Four GEX formulas:
+#
+#   GEX_unsigned  — raw gamma exposure, both legs additive.
+#                   GEX magnitude at each strike regardless of
+#                   call/put dominance. Used for MVC ranking.
+#
+#   GEX_signed    — calls minus puts. Positive = call-dominated
+#                   (ceiling / resistance). Negative = put-dominated
+#                   (floor / support). Sign indicates structural role
+#                   of the strike.
+#
+#   GEX_agg_oi    — same as GEX_signed but aggregated across all
+#                   fetched strikes using OI weighting. Positive
+#                   aggregate → pinning regime. Negative → trending.
+#                   Scalar stored in a separate summary row.
+#
+#   GEX_dealer_sp — dealer-short-puts assumption applied explicitly.
+#                   Dealers short BOTH calls and puts (sold to retail).
+#                   Net dealer gamma = -(call_gamma*call_oi +
+#                   put_gamma*put_oi) × multiplier × S².
+#                   Negative = dealers net short gamma at this strike
+#                   (magnitude indicates hedging pressure).
+#                   The sign here is always negative so what matters
+#                   is the MAGNITUDE: larger absolute value = more
+#                   hedging activity = stronger attractor.
+#
+# One DEX formula:
+#
+#   DEX           — (call_delta × call_oi + put_delta × put_oi)
+#                   × multiplier × S.
+#                   Put delta is naturally negative from BSM so put
+#                   leg subtracts automatically.
+#                   Positive DEX → calls dominate → dealers net short
+#                   delta → buy pressure as price approaches.
+#                   Negative DEX → puts dominate → dealers net long
+#                   delta → sell pressure / support from put hedging.
+#
+# All dollar values divided by 1e9 → output in $B for readability.
 # ─────────────────────────────────────────────────────────────
 def apply_formulas(df, spot_override, intra_date):
     out = df.copy()
@@ -359,85 +391,68 @@ def apply_formulas(df, spot_override, intra_date):
     def col(name):
         return out.get(name, pd.Series(0.0, index=out.index)).fillna(0)
 
-    cg   = col("call_gamma");  pg   = col("put_gamma")
-    coi  = col("call_oi");     poi  = col("put_oi")
-    cvol = col("call_volume"); pvol = col("put_volume")
-    cd   = col("call_delta");  pd_  = col("put_delta")
-    cv   = col("call_vanna");  pv   = col("put_vanna")
-    cc   = col("call_charm");  pc   = col("put_charm")
-    civ  = out.get("call_iv",  pd.Series(np.nan, index=out.index))
-    piv  = out.get("put_iv",   pd.Series(np.nan, index=out.index))
+    cg  = col("call_gamma")
+    pg  = col("put_gamma")
+    coi = col("call_oi")
+    poi = col("put_oi")
+    cd  = col("call_delta")
+    pd_ = col("put_delta")   # naturally negative from BSM
 
     S  = spot_col
     S2 = S ** 2
     M  = SPX_MULT
 
-    vsc  = (coi / cvol.replace(0, np.nan)).fillna(1).clip(0, 10)
-    vsp  = (poi / pvol.replace(0, np.nan)).fillna(1).clip(0, 10)
-    cwoi = 0.7 * coi + 0.3 * (cvol * vsc)
-    pwoi = 0.7 * poi + 0.3 * (pvol * vsp)
+    # ── GEX_unsigned ──────────────────────────────────────────
+    # Both legs add. Gamma is always positive (BSM), so this gives
+    # the total magnitude of dealer hedging required at this strike.
+    # Use this to rank strikes and find the MVC.
+    out["GEX_unsigned"]   = (cg * coi + pg * poi) * M * S2
+    out["GEX_unsigned_$"] = out["GEX_unsigned"] / 1e9
 
-    atm_iv    = civ.fillna(piv).mean()
-    iv_diff_c = civ.fillna(atm_iv) - atm_iv
-    iv_diff_p = piv.fillna(atm_iv) - atm_iv
+    # ── GEX_signed ────────────────────────────────────────────
+    # Calls minus puts. Positive = call gamma dominates = strike
+    # acts as ceiling (dealers sell into rally). Negative = put
+    # gamma dominates = strike acts as floor (dealers buy dip).
+    out["GEX_signed"]   = (cg * coi - pg * poi) * M * S2
+    out["GEX_signed_$"] = out["GEX_signed"] / 1e9
 
-    sess_open  = datetime.combine(intra_date, time(9, 30))
-    sess_close = datetime.combine(intra_date, time(16, 0))
-    total_mins = (sess_close - sess_open).seconds / 60
-
+    # ── GEX_agg_oi ────────────────────────────────────────────
+    # Aggregate GEX_signed across ALL fetched strikes using OI as
+    # weight. Scalar per timestamp (same value repeated in column
+    # for easy display alongside per-strike rows).
+    # Positive sum → positive gamma regime → pinning expected.
+    # Negative sum → negative gamma regime → trending expected.
     if "timestamp" in out.columns:
-        def _dte_frac(ts):
-            rem = max((sess_close - pd.Timestamp(ts).to_pydatetime()).total_seconds() / 60, 0)
-            return rem / total_mins
-        dte_frac = out["timestamp"].apply(_dte_frac)
+        agg_map = (out.groupby("timestamp")["GEX_signed"]
+                      .sum()
+                      .rename("GEX_agg_oi"))
+        out = out.merge(agg_map, on="timestamp", how="left")
     else:
-        dte_frac = pd.Series(0.5, index=out.index)
+        out["GEX_agg_oi"] = out["GEX_signed"].sum()
+    out["GEX_agg_oi_$"] = out["GEX_agg_oi"] / 1e9
 
-    # GEX
-    out["GEX1"]   = (cg*coi  - pg*poi)      * M * S2
-    out["GEX1_$"] = out["GEX1"] * S / 1e9
+    # ── GEX_dealer_sp ─────────────────────────────────────────
+    # Dealer-short-puts assumption made explicit.
+    # Dealers are short gamma on BOTH sides (they sold calls AND
+    # puts to retail). Their net gamma = negative of total gamma.
+    # Formula: -(call_gamma×call_oi + put_gamma×put_oi) × M × S²
+    # Result is always ≤ 0 by construction. Magnitude = hedging
+    # pressure. Largest absolute value = strongest attractor strike.
+    # Separately computed so you can compare against GEX_unsigned
+    # (which has the same magnitude but positive sign) and decide
+    # which framing fits your visual better.
+    out["GEX_dealer_sp"]   = -(cg * coi + pg * poi) * M * S2
+    out["GEX_dealer_sp_$"] = out["GEX_dealer_sp"] / 1e9
 
-    out["GEX2"]   = (cg*coi  + pg*poi)      * M * S2
-    out["GEX2_$"] = out["GEX2"] * S / 1e9
+    # ── DEX ───────────────────────────────────────────────────
+    # Delta exposure in dollars.
+    # put_delta is negative → put term naturally subtracts.
+    # Positive DEX → calls dominate → bullish attractor.
+    # Negative DEX → puts dominate → bearish attractor / floor.
+    out["DEX"]   = (cd * coi + pd_ * poi) * M * S
+    out["DEX_$"] = out["DEX"] / 1e9
 
-    total_oi      = (coi + poi).replace(0, np.nan)
-    skew          = (coi / total_oi).fillna(0.5)
-    out["GEX3"]   = (cg*coi  - skew*pg*poi) * M * S2
-    out["GEX3_$"] = out["GEX3"] * S / 1e9
-
-    out["GEX4"]   = (cg*cwoi - pg*pwoi)     * M * S2
-    out["GEX4_$"] = out["GEX4"] * S / 1e9
-
-    out["GEX5"]   = (cg*cvol - pg*pvol)     * M * S2
-    out["GEX5_$"] = out["GEX5"] * S / 1e9
-
-    # DEX
-    out["DEX1"]   = (cd*coi  - pd_*poi)     * M * S
-    out["DEX1_$"] = out["DEX1"] * S / 1e9
-
-    out["DEX2"]   = (cd*cwoi - pd_*pwoi)    * M * S
-    out["DEX2_$"] = out["DEX2"] * S / 1e9
-
-    out["DEX3"]   = (cd*cvol - pd_*pvol)    * M * S
-    out["DEX3_$"] = out["DEX3"] * S / 1e9
-
-    charm_flow    = (cc*coi  - pc*poi)  * M * dte_frac
-    out["DEX4"]   = out["DEX1"] - charm_flow * S
-    out["DEX4_$"] = out["DEX4"] * S / 1e9
-
-    vanna_flow    = (cv*coi*iv_diff_c - pv*poi*iv_diff_p) * M
-    out["DEX5"]   = out["DEX1"] + vanna_flow * S
-    out["DEX5_$"] = out["DEX5"] * S / 1e9
-
-    # Gamma flip (meaningful on snapshot — included for completeness on full series too)
-    g     = out["GEX1"].values
-    flips = []
-    for i in range(1, len(g)):
-        if not (np.isnan(g[i-1]) or np.isnan(g[i])) and g[i-1] * g[i] < 0:
-            flips.append(out["strike"].iloc[i])
-    out["_flip"] = out["strike"].isin(flips)
-
-    return out, flips
+    return out
 
 # ─────────────────────────────────────────────────────────────
 # SNAPSHOT
@@ -451,55 +466,27 @@ def get_snapshot(wide_df, target_et_full):
 
 # ─────────────────────────────────────────────────────────────
 # BUILD FULL SESSION TIME SERIES
-# Returns Greeks + GEX/DEX all formulas for every bar × strike
 # ─────────────────────────────────────────────────────────────
 def build_session_timeseries(wide_df, spot_override, intra_date, interval_minutes):
-    # Resample to requested interval first
     resampled = resample_wide(wide_df, interval_minutes)
+    result    = apply_formulas(resampled, spot_override, intra_date)
 
-    # Apply formulas
-    result, _ = apply_formulas(resampled, spot_override, intra_date)
-
-    # Keep: timestamp, strike, spot, Greeks, GEX$, DEX$
-    greek_cols = ["call_iv","call_delta","call_gamma","call_vanna","call_charm",
-                  "call_oi","call_volume",
-                  "put_iv","put_delta","put_gamma","put_vanna","put_charm",
-                  "put_oi","put_volume"]
-    gex_dex_cols = [c for c in result.columns if c.endswith("_$")]
+    greek_cols  = ["call_iv","call_delta","call_gamma","call_vanna","call_charm",
+                   "call_oi","call_volume",
+                   "put_iv","put_delta","put_gamma","put_vanna","put_charm",
+                   "put_oi","put_volume"]
+    formula_cols = [c for c in result.columns if c.endswith("_$")]
 
     keep = (["timestamp","strike","spot_used"] +
-            [c for c in greek_cols if c in result.columns] +
-            gex_dex_cols)
+              [c for c in greek_cols   if c in result.columns] +
+            [c for c in formula_cols if c in result.columns])
 
     ts_df = result[[c for c in keep if c in result.columns]].copy()
     ts_df = ts_df.rename(columns={"spot_used": "spot"})
     ts_df = ts_df.sort_values(["timestamp","strike"]).reset_index(drop=True)
-
-    # Rename dollar cols for display
-    ts_df.rename(columns={c: c.replace("_$", " ($)") for c in gex_dex_cols}, inplace=True)
+    ts_df.rename(columns={c: c.replace("_$", " ($)") for c in formula_cols
+                           if c in ts_df.columns}, inplace=True)
     return ts_df
-
-# ─────────────────────────────────────────────────────────────
-# REGIME
-# ─────────────────────────────────────────────────────────────
-def interpret_regime(df, flip_strikes):
-    gex1_sum = df["GEX1"].sum() if "GEX1" in df.columns else 0
-    dex1_sum = df["DEX1"].sum() if "DEX1" in df.columns else 0
-
-    regime = ("🔴 Negative Gamma — Trending / Volatile"
-              if gex1_sum < 0 else
-              "🟢 Positive Gamma — Mean-Reverting / Pinned")
-
-    if gex1_sum < 0 and dex1_sum > 0:
-        signal = "⚡ Bullish Move — Negative GEX + Positive DEX"
-    elif gex1_sum < 0 and dex1_sum <= 0:
-        signal = "⚡ Bearish Move — Negative GEX + Negative DEX"
-    else:
-        signal = "🔒 Pin / Fade — Positive GEX, expect mean reversion"
-        
-    flip_str = (", ".join(str(s) for s in flip_strikes)
-                if flip_strikes else "None in range")
-    return regime, signal, flip_str
 
 # ─────────────────────────────────────────────────────────────
 # FORMAT HELPERS
@@ -519,51 +506,52 @@ def fmt_df_dollars(df):
             out[c] = out[c].apply(fmt_b)
     return out
 
-def hl_flip(row):
-    flag = row.get("Flip", False)
-    return (["background-color:#fef08a;color:#000"] * len(row)
-            if flag else [""] * len(row))
-
 # ─────────────────────────────────────────────────────────────
 # DISPLAY
 # ─────────────────────────────────────────────────────────────
-def display_results(snap_df, ts_df, regime, signal, flip_str,
-                    spot_actual, date_str, et_label, interval_minutes):
+def display_results(snap_df, ts_df, spot_actual, date_str,
+                    et_label, interval_minutes):
 
-    # Header metrics
     st.subheader(f"Snapshot — {date_str}  |  {et_label}")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Regime",           regime)
-    c2.metric("Signal",           signal)
-    c3.metric("Gamma Flip Level", flip_str)
-    c4.metric("Spot at Snapshot", f"{spot_actual:.2f}" if spot_actual else "N/A")
+    c1, c2 = st.columns(2)
+    c1.metric("Spot at Snapshot", f"{spot_actual:.2f}" if spot_actual else "N/A")
+    c2.metric("Strikes in Snapshot", len(snap_df))
     st.divider()
 
-    # GEX snapshot
+    # ── GEX snapshot ──────────────────────────────────────────
     st.subheader("GEX Per Strike — Snapshot")
+    st.caption(
+        "GEX_unsigned: total gamma magnitude (use for MVC ranking)  |  "
+        "GEX_signed: calls − puts (+ = ceiling, − = floor)  |  "
+        "GEX_agg_oi: regime scalar aggregated across all fetched strikes  |  "
+        "GEX_dealer_sp: signed with dealer-short-puts assumption (always ≤ 0, magnitude = hedging pressure)"
+    )
     gex_cols = (["strike"] +
-                [c for c in snap_df.columns if c.startswith("GEX") and c.endswith("_$")] +
-                ["_flip"])
+                [c for c in snap_df.columns
+                 if c.startswith("GEX") and c.endswith("_$")])
     gex_df   = snap_df[[c for c in gex_cols if c in snap_df.columns]].copy()
-    gex_df.rename(columns={c: c.replace("_$"," ($)") for c in gex_df.columns if c.endswith("_$")},
-                  inplace=True)
-    gex_df.rename(columns={"_flip": "Flip"}, inplace=True)
-    st.dataframe(fmt_df_dollars(gex_df).style.apply(hl_flip, axis=1),
-                 use_container_width=True, hide_index=True)
+    gex_df.rename(columns={c: c.replace("_$", " ($)") for c in gex_df.columns
+                            if c.endswith("_$")}, inplace=True)
+    st.dataframe(fmt_df_dollars(gex_df), use_container_width=True, hide_index=True)
 
-    # DEX snapshot
+    # ── DEX snapshot ──────────────────────────────────────────
     st.subheader("DEX Per Strike — Snapshot")
+    st.caption(
+        "DEX = (call_delta × call_OI + put_delta × put_OI) × 100 × S  |  "
+        "Positive = calls dominate (bullish attractor)  |  "
+        "Negative = puts dominate (bearish attractor / floor)"
+    )
     dex_cols = (["strike"] +
-                [c for c in snap_df.columns if c.startswith("DEX") and c.endswith("_$")])
+                [c for c in snap_df.columns
+                 if c.startswith("DEX") and c.endswith("_$")])
     dex_df   = snap_df[[c for c in dex_cols if c in snap_df.columns]].copy()
-    dex_df.rename(columns={c: c.replace("_$"," ($)") for c in dex_df.columns if c.endswith("_$")},
-                  inplace=True)
+    dex_df.rename(columns={c: c.replace("_$", " ($)") for c in dex_df.columns
+                            if c.endswith("_$")}, inplace=True)
     st.dataframe(fmt_df_dollars(dex_df), use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # Full session time series — single unified table
-    # Columns: timestamp | strike | spot | Greeks | GEX formulas | DEX formulas
+    # ── Full session time series ───────────────────────────────
     st.subheader(
         f"Full Session Time Series — Greeks + GEX + DEX  "
         f"({interval_minutes}-min bars, all strikes)"
@@ -571,10 +559,9 @@ def display_results(snap_df, ts_df, regime, signal, flip_str,
     st.caption(
         "Columns: timestamp · strike · spot · "
         "call/put iv, delta, gamma, vanna, charm, oi, volume · "
-        "GEX1–5 ($) · DEX1–5 ($)"
+        "GEX_unsigned, GEX_signed, GEX_agg_oi, GEX_dealer_sp ($) · DEX ($)"
     )
 
-    # Split into GEX and DEX tabs so the table isn't too wide on mobile
     tab_greeks, tab_gex, tab_dex = st.tabs(["Greeks", "GEX", "DEX"])
 
     greek_display = ["call_iv","call_delta","call_gamma","call_vanna","call_charm",
@@ -590,13 +577,15 @@ def display_results(snap_df, ts_df, regime, signal, flip_str,
 
     with tab_gex:
         gex_ts_cols = (["timestamp","strike","spot"] +
-                       [c for c in ts_df.columns if c.startswith("GEX") and "($)" in c])
+                       [c for c in ts_df.columns
+                        if c.startswith("GEX") and "($)" in c])
         st.dataframe(fmt_df_dollars(ts_df[[c for c in gex_ts_cols if c in ts_df.columns]]),
                      use_container_width=True, hide_index=True)
 
     with tab_dex:
         dex_ts_cols = (["timestamp","strike","spot"] +
-                       [c for c in ts_df.columns if c.startswith("DEX") and "($)" in c])
+                       [c for c in ts_df.columns
+                        if c.startswith("DEX") and "($)" in c])
         st.dataframe(fmt_df_dollars(ts_df[[c for c in dex_ts_cols if c in ts_df.columns]]),
                      use_container_width=True, hide_index=True)
 
@@ -615,8 +604,6 @@ with st.form("params_form"):
     r2c1, r2c2 = st.columns(2)
     date_input  = r2c1.date_input("Date (EAT)", value=date.today())
 
-    # Custom time — hour and minute as separate number inputs
-    # so user can type any value, not locked to 15-min steps
     r2c2.markdown("**Session Time (EAT)**")
     t_col1, t_col2 = r2c2.columns(2)
     eat_hour   = t_col1.number_input("Hour (0–23)", min_value=0, max_value=23,
@@ -649,7 +636,6 @@ if submitted:
     if not api_key:
         st.error("Enter your iVolatility API key"); st.stop()
 
-    # Build time from separate hour/minute inputs
     eat_time      = time(int(eat_hour), int(eat_minute))
     date_str      = date_input.strftime("%Y-%m-%d")
     prev_date_str = prev_trading_day(date_input).strftime("%Y-%m-%d")
@@ -693,29 +679,28 @@ if submitted:
         st.error("No intraday data returned"); st.stop()
     st.success(f"Step 3 ✅ — {len(df_all):,} intraday rows")
 
-    # Pivot once
+    # Pivot
     with st.spinner("Building wide table..."):
         wide_df = pivot_wide(df_all)
 
-    # Snapshot at requested time
+    # Snapshot
     target_et_full = datetime.combine(intra_date, et_dt.time())
-    snap_raw = get_snapshot(wide_df, target_et_full)
+    snap_raw  = get_snapshot(wide_df, target_et_full)
 
     if snap_raw.empty:
         st.error("No bars at or before the requested time — try a later EAT time")
         st.stop()
 
-    snap_calc, flip_strikes = apply_formulas(snap_raw, spot_override, intra_date)
+    snap_calc = apply_formulas(snap_raw, spot_override, intra_date)
 
-    # Full session time series with custom display interval
+    # Full session time series
     with st.spinner(f"Building {int(interval_minutes)}-min session time series..."):
         ts_df = build_session_timeseries(
             wide_df, spot_override, intra_date, int(interval_minutes))
 
-    regime, signal, flip_str = interpret_regime(snap_calc, flip_strikes)
-
     spot_actual = (snap_calc["spot_used"].median()
                    if "spot_used" in snap_calc.columns else spot_override)
 
-    display_results(snap_calc, ts_df, regime, signal, flip_str,
-                    spot_actual, date_str, et_label, int(interval_minutes))
+    display_results(snap_calc, ts_df, spot_actual,
+                    date_str, et_label, int(interval_minutes))
+   
