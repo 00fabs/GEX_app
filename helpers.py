@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────
-# utils.py — timezone helpers, formatting, rate-limit state
+# helpers.py — timezone helpers, formatting, rate-limit state
 # ─────────────────────────────────────────────────────────────
 import time as time_module
 import requests
