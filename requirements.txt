@@ -4,4 +4,3 @@ pandas
 numpy
 scipy
 ivolatility
-streamlit_lightweight_charts
