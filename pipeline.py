@@ -44,21 +44,6 @@ def build_minute_series(wide_df: pd.DataFrame,
     
     result = apply_formulas(wide_df, spot_override, intra_date)
 
-    # ── TEMPORARY DIAGNOSTIC — remove after fixing ───────────────
-    import streamlit as st
-    st.subheader("🔍 Diagnostic: After apply_formulas() in build_minute_series")
-    st.write(f"**Result Shape:** {result.shape}")
-    st.write("**Columns containing '\( ':**", [c for c in result.columns if " \)" in c])
-    
-    st.write("**FORMULA_COLS check:**")
-    for fc in FORMULA_COLS:
-        if fc in result.columns:
-            nonzero = (result[fc] != 0).sum()
-            st.write(f"  ✅ **{fc}** → present | non-zero rows: {nonzero:,}")
-        else:
-            st.error(f"  ❌ **{fc}** → MISSING")
-    # ─────────────────────────────────────────────────────────────
-
     # Clean key names: "GEX_unsigned_$" → "GEX_unsigned"
     formula_keys = [c.replace("_$", "") for c in FORMULA_COLS]
 
@@ -84,21 +69,6 @@ def build_session_table(wide_df: pd.DataFrame,
                         intra_date) -> pd.DataFrame:
     
     result = apply_formulas(wide_df, spot_override, intra_date)
-
-    # ── TEMPORARY DIAGNOSTIC — remove after fixing ───────────────
-    import streamlit as st
-    st.subheader("🔍 Diagnostic: After apply_formulas() in build_session_table")
-    st.write(f"**Result Shape:** {result.shape}")
-    st.write("**Columns containing '\( ':**", [c for c in result.columns if " \)" in c])
-    
-    st.write("**FORMULA_COLS check:**")
-    for fc in FORMULA_COLS:
-        if fc in result.columns:
-            nonzero = (result[fc] != 0).sum()
-            st.write(f"  ✅ **{fc}** → present | non-zero rows: {nonzero:,}")
-        else:
-            st.error(f"  ❌ **{fc}** → MISSING")
-    # ─────────────────────────────────────────────────────────────
 
     # Ensure index is clean
     result = result.reset_index(drop=True)
