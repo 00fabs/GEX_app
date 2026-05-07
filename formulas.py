@@ -6,42 +6,22 @@ import numpy as np
 from config import SPX_MULT
 
 FORMULA_COLS = [
-    # ── GEX family ───────────────────────────────────────────
-    "GEX_iv_weighted_$",       # Approach 1 — live IV as position proxy
-    "GEX_relevance_$",         # Approach 2 — delta-velocity filtered GEX
-    "GEX_gir_$",               # Approach 3 — gamma imbalance ratio
-    "GEX_vanna_confirmed_$",   # Approach 4 — vanna-flow confirmed GEX
-    # ── Supporting signals ───────────────────────────────────
-    "strike_relevance",        # delta velocity magnitude — is strike in play?
-    "vanna_flow",              # vanna pressure from IV moves — wall reinforced or undermined?
-    "vanna_agreement",         # +1 vanna confirms GEX, -1 vanna contradicts GEX
-    # ── DPI ──────────────────────────────────────────────────
-    "DPI_$",                   # Dealer Pressure Index — combined Greeks score
-    # ── DEX ──────────────────────────────────────────────────
+    "GEX_unsigned_$",
+    "GEX_signed_$",
+    "GEX_agg_oi_$",
+    "GEX_dealer_sp_$",
+    "GEX_vol_weighted_$",
+    "GEX_net_oi_$",
+    "Dealer_GEX_Long_$",
+    "Dealer_GEX_Short_$",
+    "Net_Dealer_GEX_$",
     "DEX_$",
 ]
 
 
 def apply_formulas(df: pd.DataFrame, spot_override: float,
                    intra_date) -> pd.DataFrame:
-    """
-    Takes the wide-format merged dataframe (one row per timestamp+strike)
-    and computes all GEX / DEX / DPI columns.
-
-    All dollar-normalised outputs are in $Billions (divide raw by 1e9).
-
-    Parameters
-    ----------
-    df            : wide DataFrame from pipeline.pivot_wide()
-    spot_override : fallback spot price when API underlyingPrice is missing
-    intra_date    : the session date (available for time-decay formulas)
-
-    Returns
-    -------
-    df with all formula columns appended.
-    """
     out = df.copy()
-    out = out.sort_values(["strike", "timestamp"]).reset_index(drop=True)
 
     # ── Spot price ────────────────────────────────────────────
     spot_col = (out["spot"].fillna(spot_override)
@@ -53,10 +33,6 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     def col(name):
         return out.get(name, pd.Series(0.0, index=out.index)).fillna(0)
 
-    def col_nan(name):
-        """Returns column with NaN preserved — for diff calculations."""
-        return out.get(name, pd.Series(np.nan, index=out.index))
-
     cg   = col("call_gamma")
     pg   = col("put_gamma")
     coi  = col("call_oi")
@@ -65,240 +41,241 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     pvol = col("put_volume")
     cd   = col("call_delta")
     pd_  = col("put_delta")
-    cv   = col("call_vanna")
-    pv   = col("put_vanna")
-    cc   = col("call_charm")
-    pc   = col("put_charm")
-
-    civ_raw = col_nan("call_iv")
-    piv_raw = col_nan("put_iv")
-    civ     = civ_raw.fillna(0)
-    piv     = piv_raw.fillna(0)
 
     S  = spot_col
     S2 = S ** 2
     M  = SPX_MULT
 
-    # ── ATM IV — single reference value per timestamp ─────────
-    # Used for normalisation in GIR. Computed as the mean of
-    # call and put IV across all strikes at each timestamp,
-    # falling back to a session-wide mean if timestamp is absent.
+    # ── GEX: Unsigned ─────────────────────────────────────────
+    # Total gamma exposure magnitude per strike, no sign.
+    # Both calls and puts treated as positive gamma sources.
+    # Largest bar = strongest attractor / pin candidate.
+    out["GEX_unsigned"]   = (cg * coi + pg * poi) * M * S2
+    out["GEX_unsigned_$"] = out["GEX_unsigned"] / 1e9
+
+    # ── GEX: Signed ───────────────────────────────────────────
+    # Net dealer gamma per strike using OI as weight.
+    # Positive = call gamma dominates = ceiling / resistance.
+    # Negative = put gamma dominates = floor / support.
+    out["GEX_signed"]   = (cg * coi - pg * poi) * M * S2
+    out["GEX_signed_$"] = out["GEX_signed"] / 1e9
+
+    # ── GEX: Aggregated by timestamp ──────────────────────────
+    # Sum of GEX_signed across all strikes per minute bar.
+    # Positive = positive gamma regime = pinning expected.
+    # Negative = negative gamma regime = trending expected.
     if "timestamp" in out.columns:
-        atm_iv_map = (out.groupby("timestamp")
-                        .apply(lambda g: (col_nan("call_iv")
-                                          .loc[g.index]
-                                          .fillna(col_nan("put_iv")
-                                                  .loc[g.index])
-                                          .mean()))
-                        .rename("_atm_iv"))
-        out = out.merge(atm_iv_map, on="timestamp", how="left")
-        atm_iv = out["_atm_iv"].fillna(
-            civ_raw.fillna(piv_raw).mean()).replace(0, 1e-6)
-        out.drop(columns=["_atm_iv"], inplace=True)
+        agg_map = (out.groupby("timestamp")["GEX_signed"]
+                      .sum().rename("GEX_agg_oi"))
+        out = out.merge(agg_map, on="timestamp", how="left")
     else:
-        atm_iv = pd.Series(
-            civ_raw.fillna(piv_raw).mean(), index=out.index
-        ).replace(0, 1e-6)
+        out["GEX_agg_oi"] = out["GEX_signed"].sum()
+    out["GEX_agg_oi_$"] = out["GEX_agg_oi"] / 1e9
 
-    # ─────────────────────────────────────────────────────────
-    # APPROACH 1 — IV-Weighted GEX
-    # ─────────────────────────────────────────────────────────
-    # Replaces OI with live IV as the position weight.
-    # Dealers reveal real risk through how they price options —
-    # elevated IV at a strike means they're carrying gamma risk
-    # there right now, regardless of what prior-day OI says.
-    # call_IV weight → call-side gamma pressure (resistance).
-    # put_IV weight  → put-side gamma pressure (support).
-    # Positive = call IV dominates = resistance / ceiling.
-    # Negative = put IV dominates  = support  / floor.
-    # No OI dependency — fully live signal from current pricing.
-    out["GEX_iv_weighted"]   = (cg * civ - pg * piv) * M * S2
-    out["GEX_iv_weighted_$"] = out["GEX_iv_weighted"] / 1e9
+    # ── GEX: Dealer-signed perspective ────────────────────────
+    # Flip of unsigned. Always <= 0.
+    # Magnitude = total dealer hedging pressure at each strike.
+    out["GEX_dealer_sp"]   = -(cg * coi + pg * poi) * M * S2
+    out["GEX_dealer_sp_$"] = out["GEX_dealer_sp"] / 1e9
 
-    # ─────────────────────────────────────────────────────────
-    # APPROACH 2 — Delta-Velocity Strike Relevance + Filtered GEX
-    # ─────────────────────────────────────────────────────────
-    # Delta velocity: how fast is each option's delta changing
-    # bar over bar at this strike. High velocity = spot is moving
-    # toward this strike and it is entering the active hedging zone.
-    # Low velocity = strike is either far away or already passed.
+    # ── GEX: Volume-weighted signed ───────────────────────────
+    # Replaces OI with intraday volume as the position weight.
+    # More accurate for 0DTE where prior-day OI is stale.
+    # Values grow more meaningful as session volume accumulates.
+    out["GEX_vol_weighted"]   = (cg * cvol - pg * pvol) * M * S2
+    out["GEX_vol_weighted_$"] = out["GEX_vol_weighted"] / 1e9
+
+    # ── GEX: Net OI signed ────────────────────────────────────
+    # Average gamma × net OI imbalance per strike.
+    # Averaging call and put gamma removes BSM noise.
+    # Signal comes purely from OI skew at each strike.
+    gamma_avg = (cg + pg) / 2
+    out["GEX_net_oi"]   = gamma_avg * (coi - poi) * M * S2
+    out["GEX_net_oi_$"] = out["GEX_net_oi"] / 1e9
+
+    # ═════════════════════════════════════════════════════════
+    # DEALER GAMMA FRAMEWORK
+    # Convention: dealers are assumed to be short options
+    # (customers buy, dealers sell). Dealer hedging direction
+    # at each strike is therefore deterministic from gamma sign.
+    # ═════════════════════════════════════════════════════════
+
+    # ── Dealer GEX Long (stabilising pressure per strike) ────
     #
-    # strike_relevance = |Δcall_delta| + |Δput_delta| per bar.
-    # High relevance → strike is in play right now.
-    # Low relevance  → discount the GEX signal regardless of size.
+    # Measures how much gamma dealers are LONG at each strike,
+    # i.e. situations where their hedging OPPOSES price movement.
     #
-    # GEX_relevance = GEX_iv_weighted × relevance_score
-    # Large GEX bar at low-relevance strike = noise, gets damped.
-    # Large GEX bar at high-relevance strike = real wall, amplified.
+    # Mechanics:
+    #   Dealer short call → long delta → sells into rallies → stabilising
+    #   Dealer short put  → short delta → buys into dips   → stabilising
+    #
+    # Both call and put legs are additive because both represent
+    # the dealer having SOLD options to customers and therefore
+    # needing to hedge AGAINST the move at that strike.
+    #
+    # How to read the chart:
+    #   Largest positive bar = strongest pin / wall / magnet level.
+    #   Price is attracted toward high Dealer_GEX_Long strikes
+    #   because dealer hedging flows reinforce mean-reversion there.
+    #   Use these strikes as intraday support/resistance targets.
+    #
+    # Formula:
+    #   (call_gamma × call_OI + put_gamma × put_OI) × M × S²
+    #   — identical to GEX_unsigned but conceptually framed as
+    #     the stabilising component of dealer activity.
+    out["Dealer_GEX_Long_calls"] = cg * coi * M * S2
+    out["Dealer_GEX_Long_puts"]  = pg * poi * M * S2
+    out["Dealer_GEX_Long"]       = (out["Dealer_GEX_Long_calls"]
+                                    + out["Dealer_GEX_Long_puts"])
+    out["Dealer_GEX_Long_$"]     = out["Dealer_GEX_Long"] / 1e9
 
-    cd_prev = (out.groupby("strike")["call_delta"]
-                  .shift(1).fillna(out["call_delta"]))
-    pd_prev = (out.groupby("strike")["put_delta"]
-                  .shift(1).fillna(out["put_delta"]))
+    # ── Dealer GEX Short (destabilising pressure per strike) ──
+    #
+    # Measures how much gamma dealers are SHORT at each strike,
+    # i.e. situations where their hedging FOLLOWS price movement.
+    # This happens when customers are NET SELLERS of options —
+    # dealers absorb the other side and are long gamma, so they
+    # hedge WITH the move, amplifying momentum.
+    #
+    # We cannot observe customer direction directly from OI, so
+    # we estimate it via the OI skew between calls and puts:
+    #
+    #   OI_skew = (call_OI - put_OI) / (call_OI + put_OI + ε)
+    #
+    #   Range: -1 to +1
+    #   +1 = pure call OI at this strike
+    #   -1 = pure put OI at this strike
+    #    0 = perfectly balanced
+    #
+    # Then:
+    #   Dealer_GEX_Short = gamma_avg × total_OI × OI_skew × M × S²
+    #
+    # How to read the chart:
+    #   Positive bar = call OI dominates = dealers lean short calls
+    #     = they will SELL INTO RALLIES toward this strike
+    #     = RESISTANCE / CEILING — price is repelled upward.
+    #   Negative bar = put OI dominates = dealers lean short puts
+    #     = they will BUY INTO DIPS toward this strike
+    #     = SUPPORT / FLOOR — price is repelled downward.
+    #   Near zero = balanced positioning = neutral strike.
+    #   Large absolute value = strong trend amplification zone.
+    eps      = 1e-9
+    oi_skew  = (coi - poi) / (coi + poi + eps)
+    total_oi = coi + poi
+    out["Dealer_GEX_Short"]   = gamma_avg * total_oi * oi_skew * M * S2
+    out["Dealer_GEX_Short_$"] = out["Dealer_GEX_Short"] / 1e9
 
-    call_delta_velocity = (cd - cd_prev).abs()
-    put_delta_velocity  = (pd_ - pd_prev).abs()
-    strike_relevance    = call_delta_velocity + put_delta_velocity
+    # ── Net Dealer GEX per strike (primary directional map) ───
+    #
+    # The single most important formula. Subtracts the put-side
+    # dealer long gamma from the call-side dealer long gamma to
+    # produce a per-strike signed directional reading.
+    #
+    # Formula:
+    #   Net_Dealer_GEX = Dealer_GEX_Long_calls - Dealer_GEX_Long_puts
+    #                  = (call_gamma × call_OI - put_gamma × put_OI) × M × S²
+    #
+    # How to read the chart:
+    #   POSITIVE bar at a strike:
+    #     Call gamma dominates → dealers sold more calls here
+    #     → dealers sell as spot rallies toward this strike
+    #     → acts as a CEILING / RESISTANCE
+    #     → price approaching from below will face selling pressure
+    #
+    #   NEGATIVE bar at a strike:
+    #     Put gamma dominates → dealers sold more puts here
+    #     → dealers buy as spot falls toward this strike
+    #     → acts as a FLOOR / SUPPORT
+    #     → price approaching from above will face buying pressure
+    #
+    #   GAMMA FLIP LEVEL (most important single number):
+    #     The strike where Net_Dealer_GEX crosses zero is the
+    #     gamma flip level. It divides the chart into two regimes:
+    #
+    #     Spot ABOVE gamma flip:
+    #       Nearby strikes have positive Net_Dealer_GEX above
+    #       and negative below → dealers stabilise both ways
+    #       → PINNING REGIME → expect mean-reversion, tight range
+    #
+    #     Spot BELOW gamma flip:
+    #       Nearby strikes have negative Net_Dealer_GEX above
+    #       and positive below → dealers amplify both ways
+    #       → TRENDING REGIME → expect momentum, wider range
+    #
+    # Practical use:
+    #   1. Find the zero-cross nearest to spot on the chart.
+    #   2. If spot is above it → fade moves, sell breakouts.
+    #   3. If spot is below it → follow moves, buy breakouts.
+    #   4. The zero-cross strike IS the gamma flip level.
+    out["Net_Dealer_GEX"]   = (out["Dealer_GEX_Long_calls"]
+                               - out["Dealer_GEX_Long_puts"])
+    out["Net_Dealer_GEX_$"] = out["Net_Dealer_GEX"] / 1e9
 
-    # Normalise relevance to [0, 1] per timestamp so it's a
-    # clean multiplier rather than a raw Greek unit
-    if "timestamp" in out.columns:
-        rel_max = (out.groupby("timestamp")["strike"]
-                      .transform(lambda _: strike_relevance
-                                           .loc[_.index].max())
-                      .replace(0, 1e-6))
+    # ── Upper / Lower pressure (regime indicator) ─────────────
+    #
+    # Sums Net_Dealer_GEX for the 5 strikes immediately above
+    # and below spot separately to give a scalar regime signal
+    # at each minute bar without collapsing the strike dimension.
+    #
+    # Stored as per-row columns so the time-series chart can
+    # show regime evolution across the session.
+    #
+    # How to read:
+    #   Upper_pressure NEGATIVE + Lower_pressure POSITIVE:
+    #     Dealers sell above spot AND buy below spot
+    #     → PINNING / MEAN-REVERTING regime
+    #     → fade range extremes
+    #
+    #   Upper_pressure POSITIVE + Lower_pressure NEGATIVE:
+    #     Dealers buy above spot AND sell below spot
+    #     → TRENDING / DIRECTIONAL regime
+    #     → follow breakouts
+    #
+    #   The SIGN COMBINATION is the regime signal, not magnitude.
+    if "strike" in out.columns and "spot_used" in out.columns:
+        def compute_pressure(group):
+            spot_val    = group["spot_used"].iloc[0]
+            net_gex     = group["Net_Dealer_GEX"]
+            strikes_col = group["strike"]
+
+            above_mask  = (strikes_col >  spot_val) & \
+                          (strikes_col <= spot_val + 5 * 5)
+            below_mask  = (strikes_col <  spot_val) & \
+                          (strikes_col >= spot_val - 5 * 5)
+
+            upper = net_gex[above_mask].sum()
+            lower = net_gex[below_mask].sum()
+            result = group.copy()
+            result["Upper_pressure"] = upper
+            result["Lower_pressure"] = lower
+            return result
+
+        if "timestamp" in out.columns:
+            out = (out.groupby("timestamp", group_keys=False)
+                      .apply(compute_pressure))
+        else:
+            spot_val    = out["spot_used"].iloc[0]
+            net_gex     = out["Net_Dealer_GEX"]
+            strikes_col = out["strike"]
+            above_mask  = (strikes_col >  spot_val) & \
+                          (strikes_col <= spot_val + 5 * 5)
+            below_mask  = (strikes_col <  spot_val) & \
+                          (strikes_col >= spot_val - 5 * 5)
+            out["Upper_pressure"] = net_gex[above_mask].sum()
+            out["Lower_pressure"] = net_gex[below_mask].sum()
     else:
-        rel_max = strike_relevance.max() or 1e-6
+        out["Upper_pressure"] = 0.0
+        out["Lower_pressure"] = 0.0
 
-    relevance_norm = (strike_relevance / rel_max).fillna(0).clip(0, 1)
+    out["Upper_pressure_$"] = out["Upper_pressure"] / 1e9
+    out["Lower_pressure_$"] = out["Lower_pressure"] / 1e9
 
-    out["strike_relevance"] = relevance_norm
-    out["GEX_relevance"]    = out["GEX_iv_weighted"] * relevance_norm
-    out["GEX_relevance_$"]  = out["GEX_relevance"] / 1e9
-
-    # ─────────────────────────────────────────────────────────
-    # APPROACH 3 — Gamma Imbalance Ratio (GIR)
-    # ─────────────────────────────────────────────────────────
-    # Combines OI and live IV to detect which side (call or put)
-    # has dominant dealer risk at each strike, normalised by
-    # total OI and ATM IV so it's comparable across strikes and
-    # sessions.
-    #
-    # Numerator: call gamma risk (gamma × OI × IV) vs put gamma risk
-    # Denominator: total OI × ATM IV — normalises scale
-    #
-    # Positive GIR = call-side dominates adjusted for pricing = resistance.
-    # Negative GIR = put-side dominates adjusted for pricing  = support.
-    # Advantage over raw GEX_signed: a strike with moderate OI
-    # but extreme IV skew shows up strongly — closer to the truth
-    # than OI alone because dealers priced in their actual risk.
-
-    total_oi_safe = (coi + poi).replace(0, np.nan)
-    gir_num       = (cg * coi * civ) - (pg * poi * piv)
-    gir_den       = total_oi_safe * atm_iv
-    gir_raw       = (gir_num / gir_den).fillna(0)
-
-    # Scale back to dollar terms using S² × M so it plots on
-    # a comparable axis to the other GEX formulas
-    out["GEX_gir"]   = gir_raw * M * S2
-    out["GEX_gir_$"] = out["GEX_gir"] / 1e9
-
-    # ─────────────────────────────────────────────────────────
-    # APPROACH 4 — Vanna Flow + Confirmation Filter
-    # ─────────────────────────────────────────────────────────
-    # Vanna = dDelta/dIV. When IV moves, vanna forces delta
-    # hedging even without a spot price move.
-    #
-    # vanna_flow: net vanna-driven hedging pressure from the IV
-    # move at this strike since the previous bar.
-    # Positive = IV move is creating buying pressure here.
-    # Negative = IV move is creating selling pressure here.
-    #
-    # vanna_agreement: does vanna reinforce or undermine GEX?
-    # +1 = vanna and GEX_iv_weighted agree in sign → trust the wall.
-    # -1 = they disagree → wall is being undermined by IV movement,
-    #      discount the GEX bar even if it looks large.
-    #
-    # GEX_vanna_confirmed = GEX_iv_weighted × (1 + agreement × 0.5)
-    # Agreement amplifies the signal by 50%. Disagreement damps it
-    # to 50% of face value rather than zeroing it — GEX still exists,
-    # it just has reduced conviction.
-
-    civ_prev = (out.groupby("strike")["call_iv"]
-                   .shift(1).fillna(out["call_iv"])
-                   if "call_iv" in out.columns
-                   else pd.Series(0.0, index=out.index))
-    piv_prev = (out.groupby("strike")["put_iv"]
-                   .shift(1).fillna(out["put_iv"])
-                   if "put_iv" in out.columns
-                   else pd.Series(0.0, index=out.index))
-
-    civ_move = (civ - civ_prev.fillna(0))
-    piv_move = (piv - piv_prev.fillna(0))
-
-    vanna_flow = ((cv * coi * civ_move) -
-                  (pv * poi * piv_move))
-    out["vanna_flow"] = vanna_flow
-
-    gex_sign   = np.sign(out["GEX_iv_weighted"].replace(0, np.nan)
-                            .fillna(0))
-    vanna_sign = np.sign(vanna_flow.replace(0, np.nan).fillna(0))
-    agreement  = np.where(gex_sign == vanna_sign, 1.0,
-                          np.where(vanna_sign == 0, 0.0, -1.0))
-    out["vanna_agreement"] = agreement
-
-    confirmation_multiplier = 1.0 + agreement * 0.5
-    out["GEX_vanna_confirmed"]   = (out["GEX_iv_weighted"]
-                                    * confirmation_multiplier)
-    out["GEX_vanna_confirmed_$"] = out["GEX_vanna_confirmed"] / 1e9
-
-    # ─────────────────────────────────────────────────────────
-    # DPI — Dealer Pressure Index
-    # ─────────────────────────────────────────────────────────
-    # Combines four sources of dealer hedging pressure into one
-    # signed score per strike.
-    #
-    # Component 1 — Gamma pressure (immediate, spot-driven)
-    #   How much do dealers need to hedge RIGHT NOW if spot moves
-    #   to this strike. Uses IV-weighted GEX as the best live proxy.
-    #
-    # Component 2 — Delta pressure (directional, existing position)
-    #   What directional hedge do dealers already have at this strike.
-    #   High absolute delta = large existing position, low gamma = stable.
-    #   Uses DEX logic: call delta positive, put delta negative.
-    #
-    # Component 3 — Vanna pressure (IV-driven, no spot move needed)
-    #   If IV is moving, vanna forces delta adjustments at this strike
-    #   independent of spot. Critical for 0DTE where IV can spike fast.
-    #   Uses vanna_flow computed above.
-    #
-    # Component 4 — Charm pressure (time-driven, intraday decay)
-    #   As time passes, option deltas decay via charm. Dealers unwind
-    #   hedges regardless of price. Accelerates after 2pm ET on 0DTE.
-    #   Positive charm pressure = hedge unwind creates buying flow.
-    #   Negative = unwind creates selling flow.
-    #
-    # Weights (tunable — adjust after backtesting):
-    #   w1=0.40  gamma is the primary signal for 0DTE walls
-    #   w2=0.25  delta pressure is the directional bias
-    #   w3=0.20  vanna is the key modifier for IV-volatile sessions
-    #   w4=0.15  charm matters most in final 2 hours
-    #
-    # Positive DPI = net buying pressure from dealer hedging = support.
-    # Negative DPI = net selling pressure = resistance.
-    # Largest absolute DPI bar = highest conviction strike right now.
-
-    gamma_pressure = out["GEX_iv_weighted"]                    # $raw
-    delta_pressure = (cd * coi + pd_ * poi) * M * S            # DEX raw
-    vanna_pressure = vanna_flow * S                             # scale to $ terms
-    charm_pressure = (cc * coi - pc * poi) * M                 # charm flow raw
-
-    w1, w2, w3, w4 = 0.40, 0.25, 0.20, 0.15
-
-    # Normalise each component to the same scale before weighting
-    # so a large vanna_pressure doesn't swamp gamma_pressure.
-    # We divide each by its session-wide std (robust to outliers).
-    def safe_norm(series):
-        std = series.std()
-        if std == 0 or np.isnan(std):
-            return series.fillna(0)
-        return (series / std).fillna(0)
-
-    dpi_raw = (w1 * safe_norm(gamma_pressure) +
-               w2 * safe_norm(delta_pressure) +
-               w3 * safe_norm(vanna_pressure) +
-               w4 * safe_norm(charm_pressure))
-
-    # Re-scale DPI to dollar terms using S² × M so it plots
-    # on the same axis as GEX formulas
-    out["DPI"]   = dpi_raw * M * S2
-    out["DPI_$"] = out["DPI"] / 1e9
-
-    # ── DEX — Delta Exposure ──────────────────────────────────
-    # Total directional exposure dealers must hedge per strike.
-    # Call delta positive, put delta already negative from BSM.
-    # Positive = calls dominate = bullish attractor.
-    # Negative = puts dominate  = bearish attractor / floor.
+    # ── DEX: Delta Exposure ───────────────────────────────────
+    # Total directional delta dealers must hedge per strike.
+    # Positive = calls dominate = dealers net short delta
+    #   = they buy as price approaches = bullish attractor.
+    # Negative = puts dominate = dealers net long delta
+    #   = bearish attractor / put-supported floor.
     out["DEX"]   = (cd * coi + pd_ * poi) * M * S
     out["DEX_$"] = out["DEX"] / 1e9
 
