@@ -123,7 +123,7 @@ if submitted:
     minute_series, sorted_ts, all_strikes, formula_keys = \
         build_minute_series(wide_df, spot_override_input, date_input)
 
-    # Clear stale radio button keys to prevent old selection errors
+    # Clear stale radio button keys
     st.session_state.pop("gex_formula_radio", None)
     st.session_state.pop("dex_formula_radio", None)
 
@@ -139,7 +139,7 @@ if submitted:
     st.success("✅ Done. Use controls below to step through the session.")
 
 # ── Visualization ─────────────────────────────────────────────
-if st.session_state["computed"]:
+if st.session_state.get("computed", False):
     ms           = st.session_state["minute_series"]
     sorted_ts    = st.session_state["sorted_ts"]
     all_strikes  = st.session_state["all_strikes"]
@@ -211,21 +211,25 @@ if st.session_state["computed"]:
         chart_type = st.radio(
             "Chart", ["GEX", "DEX"],
             horizontal=True, key="chart_type_radio")
+
     with tc2:
         if chart_type == "GEX":
+            options = gex_keys if gex_keys else ["No GEX formulas"]
             formula_choice = st.radio(
-                "GEX Formula", gex_keys,
+                "GEX Formula", options,
                 index=0,
                 horizontal=True, key="gex_formula_radio")
         else:
+            options = dex_keys if dex_keys else ["No DEX formulas"]
             formula_choice = st.radio(
-                "DEX Formula", dex_keys,
+                "DEX Formula", options,
                 index=0,
                 horizontal=True, key="dex_formula_radio")
 
-    # Guard against empty selection
-    if not formula_choice:
-        formula_choice = gex_keys[0] if chart_type == "GEX" else dex_keys[0]
+    # Final safety guard
+    if not formula_choice or formula_choice in ["No GEX formulas", "No DEX formulas"]:
+        formula_choice = (gex_keys[0] if gex_keys else 
+                         (dex_keys[0] if dex_keys else "unknown"))
 
     fkey = formula_choice
 
