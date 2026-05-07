@@ -1,9 +1,12 @@
 # ─────────────────────────────────────────────────────────────
 # pipeline.py — pivot, session series builder, table builder
+# Formula keys are read dynamically from formulas.FORMULA_COLS
+# so adding a formula to formulas.py is the only step needed.
 # ─────────────────────────────────────────────────────────────
 import pandas as pd
 import numpy as np
-from formulas import apply_formulas
+from formulas import apply_formulas, FORMULA_COLS
+
 
 COL_MAP = {
     "optionDelta":    "delta",
@@ -38,43 +41,47 @@ def pivot_wide(df_all: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_minute_series(wide_df: pd.DataFrame,
-                         spot_override: float,
-                         intra_date) -> tuple:
+                        spot_override: float,
+                        intra_date) -> tuple:
     """
+    Dynamically reads FORMULA_COLS from formulas.py.
+    Adding a new formula to formulas.py automatically makes it
+    available in the chart and data tables — no other file needs
+    to change.
+
     Returns
     -------
-    series      : dict  { "HH:MM" -> { strike_int -> {formula_key->float} } }
-    sorted_ts   : list of sorted timestamp strings
+    series      : dict { "HH:MM" -> { strike_int -> { formula_key->float, "spot"->float } } }
+    sorted_ts   : sorted list of timestamp strings
     all_strikes : sorted list of all strike ints
+    formula_keys: list of clean key names (strip trailing _$) for UI
     """
     result = apply_formulas(wide_df, spot_override, intra_date)
+
+    # Derive clean key names from FORMULA_COLS
+    # e.g. "GEX_unsigned_$" -> "GEX_unsigned"
+    formula_keys = [c.replace("_$", "") for c in FORMULA_COLS]
 
     series = {}
     for ts, grp in result.groupby("timestamp"):
         ts_key       = pd.Timestamp(ts).strftime("%H:%M")
         strikes_data = {}
         for _, row in grp.iterrows():
-            sk = int(row["strike"])
-            strikes_data[sk] = {
-                "GEX_unsigned":  float(row.get("GEX_unsigned_$",  0) or 0),
-                "GEX_signed":    float(row.get("GEX_signed_$",    0) or 0),
-                "GEX_agg_oi":   float(row.get("GEX_agg_oi_$",    0) or 0),
-                "GEX_dealer_sp": float(row.get("GEX_dealer_sp_$", 0) or 0),
-                "DEX":           float(row.get("DEX_$",            0) or 0),
-                "spot":          float(row.get("spot_used",
-                                               spot_override) or spot_override),
-            }
+            sk      = int(row["strike"])
+            entry   = {"spot": float(row.get("spot_used", spot_override) or spot_override)}
+            for fkey, fcol in zip(formula_keys, FORMULA_COLS):
+                entry[fkey] = float(row.get(fcol, 0) or 0)
+            strikes_data[sk] = entry
         series[ts_key] = strikes_data
 
     sorted_ts   = sorted(series.keys())
-    all_strikes = sorted({sk for ts_data in series.values()
-                          for sk in ts_data})
-    return series, sorted_ts, all_strikes
+    all_strikes = sorted({sk for ts_data in series.values() for sk in ts_data})
+    return series, sorted_ts, all_strikes, formula_keys
 
 
 def build_session_table(wide_df: pd.DataFrame,
-                         spot_override: float,
-                         intra_date) -> pd.DataFrame:
+                        spot_override: float,
+                        intra_date) -> pd.DataFrame:
     result = apply_formulas(wide_df, spot_override, intra_date)
 
     greek_cols   = ["call_iv","call_delta","call_gamma","call_vanna",
@@ -90,7 +97,6 @@ def build_session_table(wide_df: pd.DataFrame,
     ts_df = ts_df.rename(columns={"spot_used": "spot"})
     ts_df = ts_df.sort_values(["timestamp","strike"]).reset_index(drop=True)
     ts_df.rename(columns={c: c.replace("_$", " ($)")
-                           for c in formula_cols
-                           if c in ts_df.columns},
+                           for c in formula_cols if c in ts_df.columns},
                  inplace=True)
     return ts_df
