@@ -41,21 +41,24 @@ def pivot_wide(df_all: pd.DataFrame) -> pd.DataFrame:
 def build_minute_series(wide_df: pd.DataFrame,
                         spot_override: float,
                         intra_date) -> tuple:
+    
     result = apply_formulas(wide_df, spot_override, intra_date)
 
-# TEMPORARY DIAGNOSTIC
-import streamlit as st
-st.write("apply_formulas output columns:", [c for c in result.columns if "$" in c])
-st.write("FORMULA_COLS:", FORMULA_COLS)
-st.write("Match check:")
-for fc in FORMULA_COLS:
-    present = fc in result.columns
-    if present:
-        nonzero = (result[fc] != 0).sum()
-        st.write(f"  {fc} — ✅ present | non-zero rows: {nonzero}")
-    else:
-        st.write(f"  {fc} — ❌ MISSING")
-        
+    # ── TEMPORARY DIAGNOSTIC — remove after fixing ───────────────
+    import streamlit as st
+    st.subheader("🔍 Diagnostic: After apply_formulas() in build_minute_series")
+    st.write(f"**Result Shape:** {result.shape}")
+    st.write("**Columns containing '\( ':**", [c for c in result.columns if " \)" in c])
+    
+    st.write("**FORMULA_COLS check:**")
+    for fc in FORMULA_COLS:
+        if fc in result.columns:
+            nonzero = (result[fc] != 0).sum()
+            st.write(f"  ✅ **{fc}** → present | non-zero rows: {nonzero:,}")
+        else:
+            st.error(f"  ❌ **{fc}** → MISSING")
+    # ─────────────────────────────────────────────────────────────
+
     # Clean key names: "GEX_unsigned_$" → "GEX_unsigned"
     formula_keys = [c.replace("_$", "") for c in FORMULA_COLS]
 
@@ -79,9 +82,25 @@ for fc in FORMULA_COLS:
 def build_session_table(wide_df: pd.DataFrame,
                         spot_override: float,
                         intra_date) -> pd.DataFrame:
+    
     result = apply_formulas(wide_df, spot_override, intra_date)
 
-    # Ensure index is clean after apply_formulas
+    # ── TEMPORARY DIAGNOSTIC — remove after fixing ───────────────
+    import streamlit as st
+    st.subheader("🔍 Diagnostic: After apply_formulas() in build_session_table")
+    st.write(f"**Result Shape:** {result.shape}")
+    st.write("**Columns containing '\( ':**", [c for c in result.columns if " \)" in c])
+    
+    st.write("**FORMULA_COLS check:**")
+    for fc in FORMULA_COLS:
+        if fc in result.columns:
+            nonzero = (result[fc] != 0).sum()
+            st.write(f"  ✅ **{fc}** → present | non-zero rows: {nonzero:,}")
+        else:
+            st.error(f"  ❌ **{fc}** → MISSING")
+    # ─────────────────────────────────────────────────────────────
+
+    # Ensure index is clean
     result = result.reset_index(drop=True)
 
     greek_cols   = ["call_iv","call_delta","call_gamma","call_vanna",
@@ -90,7 +109,6 @@ def build_session_table(wide_df: pd.DataFrame,
                     "put_charm","put_oi","put_volume"]
     formula_cols = [c for c in result.columns if c.endswith("_$")]
 
-    # Only keep columns that actually exist after reset
     available = set(result.columns)
 
     keep = []
@@ -103,12 +121,13 @@ def build_session_table(wide_df: pd.DataFrame,
     ts_df = result[keep].copy()
     ts_df = ts_df.rename(columns={"spot_used": "spot"})
 
-    # Safe sort — only sort by columns that exist
+    # Safe sort
     sort_cols = [c for c in ["timestamp", "strike"] if c in ts_df.columns]
     if sort_cols:
         ts_df = ts_df.sort_values(sort_cols).reset_index(drop=True)
 
-    ts_df.rename(columns={c: c.replace("_$", " ($)")
+    # Rename formula columns for display
+    ts_df.rename(columns={c: c.replace("_\( ", " ( \))")
                            for c in formula_cols if c in ts_df.columns},
                  inplace=True)
     return ts_df
