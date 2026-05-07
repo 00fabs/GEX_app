@@ -55,6 +55,7 @@ for fc in FORMULA_COLS:
         st.write(f"  {fc} — ✅ present | non-zero rows: {nonzero}")
     else:
         st.write(f"  {fc} — ❌ MISSING")
+        
     # Clean key names: "GEX_unsigned_$" → "GEX_unsigned"
     formula_keys = [c.replace("_$", "") for c in FORMULA_COLS]
 
