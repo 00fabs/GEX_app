@@ -35,7 +35,7 @@ div[data-testid="stRadio"] label:hover span { color: #26a69a; }
 def init_state():
     defaults = dict(
         computed=False, minute_series={}, sorted_ts=[],
-        all_strikes=[], ts_index=0, step_size=1,
+        all_strikes=[], formula_keys=[], ts_index=0, step_size=1,
         ts_table=None, date_str="",
         spot_override=5500.0, intra_date=None)
     for k, v in defaults.items():
