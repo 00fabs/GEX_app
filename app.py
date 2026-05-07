@@ -113,19 +113,47 @@ if submitted:
         st.error("No intraday data returned"); st.stop()
     st.success(f"Step 3  {len(df_all):,} rows")
 
+    # ====================== COMPUTE WIDE DF ======================
     with st.spinner("Computing GEX / DEX..."):
-        wide_df  = pivot_wide(df_all)
-        ts_table = build_session_table(
-            wide_df, spot_override_input, date_input)
-        minute_series, sorted_ts, all_strikes, formula_keys = \
-            build_minute_series(wide_df, spot_override_input, date_input)
+        wide_df = pivot_wide(df_all)
+
+    # ── TEMPORARY DIAGNOSTIC — remove after fixing ───────────────
+    st.subheader("🔍 Diagnostic: After pivot_wide()")
+    st.write(f"**Shape:** {wide_df.shape}")
+    st.write("**Columns:**", list(wide_df.columns))
+
+    st.write("**Sample rows:**")
+    st.dataframe(wide_df.head(10))
+
+    # Check critical columns
+    for c in ["call_oi", "put_oi", "call_gamma", "put_gamma"]:
+        if c in wide_df.columns:
+            non_zero = (wide_df[c] != 0).sum()
+            nulls = wide_df[c].isna().sum()
+            sample = wide_df[c].dropna().head(5).tolist()
+            st.write(f"✅ **{c}** → Non-zero: {non_zero:,} | "
+                     f"Nulls: {nulls} | Sample: {sample}")
+        else:
+            st.error(f"❌ Missing column: **{c}**")
+    # ─────────────────────────────────────────────────────────────
+
+    # Continue with normal flow
+    ts_table = build_session_table(
+        wide_df, spot_override_input, date_input)
+
+    minute_series, sorted_ts, all_strikes, formula_keys = \
+        build_minute_series(wide_df, spot_override_input, date_input)
 
     st.session_state.update(dict(
-        minute_series=minute_series, sorted_ts=sorted_ts,
-        all_strikes=all_strikes,     formula_keys=formula_keys,
-        ts_table=ts_table,           ts_index=0,
+        minute_series=minute_series, 
+        sorted_ts=sorted_ts,
+        all_strikes=all_strikes,     
+        formula_keys=formula_keys,
+        ts_table=ts_table,           
+        ts_index=0,
         computed=True))
-    st.success(" Done. Use controls below to step through the session.")
+
+    st.success("✅ Done. Use controls below to step through the session.")
 
 # ── Visualization ─────────────────────────────────────────────
 if st.session_state["computed"]:
@@ -146,14 +174,12 @@ if st.session_state["computed"]:
     with cc1:
         if st.button("◀ Prev", use_container_width=True):
             st.session_state["ts_index"] = max(
-                0, st.session_state["ts_index"]
-                   - st.session_state["step_size"])
+                0, st.session_state["ts_index"] - st.session_state["step_size"])
     with cc2:
         if st.button("Next ▶", use_container_width=True):
             st.session_state["ts_index"] = min(
                 len(sorted_ts) - 1,
-                st.session_state["ts_index"]
-                + st.session_state["step_size"])
+                st.session_state["ts_index"] + st.session_state["step_size"])
     with cc3:
         opts = [1, 2, 5, 10, 15, 30]
         st.session_state["step_size"] = st.selectbox(
@@ -193,28 +219,21 @@ if st.session_state["computed"]:
         f" &nbsp;|&nbsp; Bar {idx+1}/{len(sorted_ts)}",
         unsafe_allow_html=True)
 
-    # ── Formula toggles (fully dynamic from FORMULA_COLS) ────
+    # ── Formula toggles ───────────────────────────────────────
     gex_keys = [k for k in formula_keys if k.startswith("GEX")]
     dex_keys = [k for k in formula_keys if k.startswith("DEX")]
 
     tc1, tc2 = st.columns(2)
     with tc1:
-        chart_type = st.radio(
-            "Chart", ["GEX", "DEX"],
-            horizontal=True, key="chart_type_radio")
+        chart_type = st.radio("Chart", ["GEX", "DEX"], horizontal=True, key="chart_type_radio")
     with tc2:
         if chart_type == "GEX":
-            formula_choice = st.radio(
-                "GEX Formula", gex_keys,
-                horizontal=True, key="gex_formula_radio")
+            formula_choice = st.radio("GEX Formula", gex_keys, horizontal=True, key="gex_formula_radio")
         else:
-            formula_choice = st.radio(
-                "DEX Formula", dex_keys,
-                horizontal=True, key="dex_formula_radio")
+            formula_choice = st.radio("DEX Formula", dex_keys, horizontal=True, key="dex_formula_radio")
 
     fkey       = formula_choice
-    chart_data = [{"strike": sk,
-                   "value":  ts_data.get(sk, {}).get(fkey, 0.0)}
+    chart_data = [{"strike": sk, "value": ts_data.get(sk, {}).get(fkey, 0.0)}
                   for sk in all_strikes]
     title      = f"{fkey}  —  {date_str}  |  {cur_ts} ET  |  Spot {cur_spot:.2f}"
 
@@ -242,9 +261,7 @@ if st.session_state["computed"]:
                         [c for c in ts_table.columns
                          if c.startswith("GEX") and "($)" in c])
         st.dataframe(
-            fmt_df_dollars(
-                ts_table[[c for c in gex_tab_cols
-                          if c in ts_table.columns]]),
+            fmt_df_dollars(ts_table[[c for c in gex_tab_cols if c in ts_table.columns]]),
             use_container_width=True, hide_index=True)
 
     with tab_dex:
@@ -252,7 +269,5 @@ if st.session_state["computed"]:
                         [c for c in ts_table.columns
                          if c.startswith("DEX") and "($)" in c])
         st.dataframe(
-            fmt_df_dollars(
-                ts_table[[c for c in dex_tab_cols
-                          if c in ts_table.columns]]),
+            fmt_df_dollars(ts_table[[c for c in dex_tab_cols if c in ts_table.columns]]),
             use_container_width=True, hide_index=True)
