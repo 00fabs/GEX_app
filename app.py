@@ -117,7 +117,7 @@ if submitted:
     with st.spinner("Computing GEX / DEX..."):
         wide_df = pivot_wide(df_all)
 
-    # ── TEMPORARY DIAGNOSTIC — remove after fixing ───────────────
+    # ── TEMPORARY DIAGNOSTIC — After pivot_wide() ───────────────
     st.subheader("🔍 Diagnostic: After pivot_wide()")
     st.write(f"**Shape:** {wide_df.shape}")
     st.write("**Columns:**", list(wide_df.columns))
@@ -125,7 +125,6 @@ if submitted:
     st.write("**Sample rows:**")
     st.dataframe(wide_df.head(10))
 
-    # Check critical columns
     for c in ["call_oi", "put_oi", "call_gamma", "put_gamma"]:
         if c in wide_df.columns:
             non_zero = (wide_df[c] != 0).sum()
@@ -232,10 +231,29 @@ if st.session_state["computed"]:
         else:
             formula_choice = st.radio("DEX Formula", dex_keys, horizontal=True, key="dex_formula_radio")
 
-    fkey       = formula_choice
-    chart_data = [{"strike": sk, "value": ts_data.get(sk, {}).get(fkey, 0.0)}
+    fkey = formula_choice
+
+    # ── TEMPORARY DIAGNOSTIC — Before building chart ─────────────
+    st.subheader("🔍 Diagnostic: Before build_histogram_chart()")
+    st.write("**formula_keys:**", formula_keys)
+    st.write("**fkey being used:**", fkey)
+    if all_strikes:
+        first_strike = all_strikes[0]
+        sample_keys = list(ts_data.get(first_strike, {}).keys())
+        sample_value = ts_data.get(first_strike, {}).get(fkey, "KEY NOT FOUND")
+        st.write(f"**First strike:** {first_strike}")
+        st.write("**Sample ts_data keys:**", sample_keys)
+        st.write(f"**Sample value for '{fkey}':**", sample_value)
+    else:
+        st.write("**No strikes available**")
+    # ─────────────────────────────────────────────────────────────
+
+    # Build chart data
+    chart_data = [{"strike": sk,
+                   "value": ts_data.get(sk, {}).get(fkey, 0.0)}
                   for sk in all_strikes]
-    title      = f"{fkey}  —  {date_str}  |  {cur_ts} ET  |  Spot {cur_spot:.2f}"
+    
+    title = f"{fkey}  —  {date_str}  |  {cur_ts} ET  |  Spot {cur_spot:.2f}"
 
     build_histogram_chart(chart_data, cur_spot, title)
 
