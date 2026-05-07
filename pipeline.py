@@ -43,6 +43,18 @@ def build_minute_series(wide_df: pd.DataFrame,
                         intra_date) -> tuple:
     result = apply_formulas(wide_df, spot_override, intra_date)
 
+# TEMPORARY DIAGNOSTIC
+import streamlit as st
+st.write("apply_formulas output columns:", [c for c in result.columns if "$" in c])
+st.write("FORMULA_COLS:", FORMULA_COLS)
+st.write("Match check:")
+for fc in FORMULA_COLS:
+    present = fc in result.columns
+    if present:
+        nonzero = (result[fc] != 0).sum()
+        st.write(f"  {fc} — ✅ present | non-zero rows: {nonzero}")
+    else:
+        st.write(f"  {fc} — ❌ MISSING")
     # Clean key names: "GEX_unsigned_$" → "GEX_unsigned"
     formula_keys = [c.replace("_$", "") for c in FORMULA_COLS]
 
