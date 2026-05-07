@@ -115,6 +115,21 @@ if submitted:
 
     with st.spinner("Computing GEX / DEX..."):
         wide_df  = pivot_wide(df_all)
+      # ── TEMPORARY DIAGNOSTIC — remove after fixing ───────────────
+st.write("### Diagnostic")
+st.write("wide_df columns:", list(wide_df.columns))
+st.write("wide_df shape:", wide_df.shape)
+st.write("Sample rows:")
+st.dataframe(wide_df.head(10))
+
+# Check if OI columns exist and have non-zero values
+for c in ["call_oi", "put_oi", "call_gamma", "put_gamma"]:
+    if c in wide_df.columns:
+        st.write(f"{c} — non-zero count: {(wide_df[c] != 0).sum()}, "
+                 f"null count: {wide_df[c].isna().sum()}, "
+                 f"sample values: {wide_df[c].dropna().head(5).tolist()}")
+    else:
+        st.write(f"{c} — COLUMN MISSING")
         ts_table = build_session_table(
             wide_df, spot_override_input, date_input)
         minute_series, sorted_ts, all_strikes, formula_keys = \
