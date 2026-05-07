@@ -56,11 +56,11 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     #   Largest bar = strongest pin / wall / magnet level.
     #   Price is attracted to high Dealer_GEX_Long strikes.
     #   Use as intraday support/resistance targets.
-    out["Dealer_GEX_Long_calls"] = cg * coi * M * S2
-    out["Dealer_GEX_Long_puts"]  = pg * poi * M * S2
-    out["Dealer_GEX_Long"]       = (out["Dealer_GEX_Long_calls"]
-                                    + out["Dealer_GEX_Long_puts"])
-    out["Dealer_GEX_Long_$"]     = out["Dealer_GEX_Long"] / 1e9
+    out["GEX_Dealer_Long_calls"] = cg * coi * M * S2
+    out["GEX_Dealer_Long_puts"]  = pg * poi * M * S2
+    out["GEX_Dealer_Long"]       = (out["GEX_Dealer_Long_calls"]
+                                    + out["GEX_Dealer_Long_puts"])
+    out["GEX_Dealer_Long_$"]     = out["GEX_Dealer_Long"] / 1e9
 
     # ── Dealer GEX Short (destabilising pressure per strike) ──
     #
@@ -82,8 +82,8 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     eps      = 1e-9
     oi_skew  = (coi - poi) / (coi + poi + eps)
     total_oi = coi + poi
-    out["Dealer_GEX_Short"]   = gamma_avg * total_oi * oi_skew * M * S2
-    out["Dealer_GEX_Short_$"] = out["Dealer_GEX_Short"] / 1e9
+    out["GEX_Dealer_Short"]   = gamma_avg * total_oi * oi_skew * M * S2
+    out["GEX_Dealer_Short_$"] = out["GEX_Dealer_Short"] / 1e9
 
     # ── Net Dealer GEX per strike (primary directional map) ───
     #
@@ -108,9 +108,9 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     #   Spot BELOW gamma flip:
     #     Dealers amplify both up and down → TRENDING REGIME
     #     → follow moves, buy breakouts, expect wider range
-    out["Net_Dealer_GEX"]   = (out["Dealer_GEX_Long_calls"]
-                               - out["Dealer_GEX_Long_puts"])
-    out["Net_Dealer_GEX_$"] = out["Net_Dealer_GEX"] / 1e9
+    out["GEX_Net_Dealer"]   = (out["GEX_Dealer_Long_calls"]
+                               - out["GEX_Dealer_Long_puts"])
+    out["GEX_Net_Dealer_$"] = out["GEX_Net_Dealer"] / 1e9
 
     # ── Upper / Lower pressure (regime indicator) ─────────────
     #
@@ -130,14 +130,14 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     # Computed without groupby().apply() to preserve index integrity.
     NEARBY = 5 * 5   # 5 strikes × $5 step = $25 band each side
 
-    out["Upper_pressure"] = 0.0
-    out["Lower_pressure"] = 0.0
+    out["GEX_Upper_pressure"] = 0.0
+    out["GEX_Lower_pressure"] = 0.0
 
     if "strike" in out.columns and "timestamp" in out.columns:
         # Vectorised: build masks per row using aligned series
         strikes_s   = out["strike"].values
         spot_s      = out["spot_used"].values
-        net_gex_s   = out["Net_Dealer_GEX"].values
+        net_gex_s   = out["GEX_Net_Dealer"].values
         timestamps_s= out["timestamp"].values
 
         # Build per-timestamp lookup: ts → {strike → net_gex}
@@ -157,11 +157,11 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
             upper_vals[i] = upper
             lower_vals[i] = lower
 
-        out["Upper_pressure"] = upper_vals
-        out["Lower_pressure"] = lower_vals
+        out["GEX_Upper_pressure"] = upper_vals
+        out["GEX_Lower_pressure"] = lower_vals
 
-    out["Upper_pressure_$"] = out["Upper_pressure"] / 1e9
-    out["Lower_pressure_$"] = out["Lower_pressure"] / 1e9
+    out["GEX_Upper_pressure_$"] = out["GEX_Upper_pressure"] / 1e9
+    out["GEX_Lower_pressure_$"] = out["GEX_Lower_pressure"] / 1e9
 
     # ── DEX: Delta Exposure ───────────────────────────────────
     #
