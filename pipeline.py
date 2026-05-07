@@ -1,7 +1,5 @@
 # ─────────────────────────────────────────────────────────────
 # pipeline.py — pivot, session series builder, table builder
-# Formula keys are read dynamically from formulas.FORMULA_COLS
-# so adding a formula to formulas.py is the only step needed.
 # ─────────────────────────────────────────────────────────────
 import pandas as pd
 import numpy as np
@@ -43,23 +41,9 @@ def pivot_wide(df_all: pd.DataFrame) -> pd.DataFrame:
 def build_minute_series(wide_df: pd.DataFrame,
                         spot_override: float,
                         intra_date) -> tuple:
-    """
-    Dynamically reads FORMULA_COLS from formulas.py.
-    Adding a new formula to formulas.py automatically makes it
-    available in the chart and data tables — no other file needs
-    to change.
-
-    Returns
-    -------
-    series      : dict { "HH:MM" -> { strike_int -> { formula_key->float, "spot"->float } } }
-    sorted_ts   : sorted list of timestamp strings
-    all_strikes : sorted list of all strike ints
-    formula_keys: list of clean key names (strip trailing _$) for UI
-    """
     result = apply_formulas(wide_df, spot_override, intra_date)
 
-    # Derive clean key names from FORMULA_COLS
-    # e.g. "GEX_unsigned_$" -> "GEX_unsigned"
+    # Clean key names: "GEX_unsigned_$" → "GEX_unsigned"
     formula_keys = [c.replace("_$", "") for c in FORMULA_COLS]
 
     series = {}
@@ -67,8 +51,8 @@ def build_minute_series(wide_df: pd.DataFrame,
         ts_key       = pd.Timestamp(ts).strftime("%H:%M")
         strikes_data = {}
         for _, row in grp.iterrows():
-            sk      = int(row["strike"])
-            entry   = {"spot": float(row.get("spot_used", spot_override) or spot_override)}
+            sk    = int(row["strike"])
+            entry = {"spot": float(row.get("spot_used", spot_override) or spot_override)}
             for fkey, fcol in zip(formula_keys, FORMULA_COLS):
                 entry[fkey] = float(row.get(fcol, 0) or 0)
             strikes_data[sk] = entry
@@ -84,18 +68,33 @@ def build_session_table(wide_df: pd.DataFrame,
                         intra_date) -> pd.DataFrame:
     result = apply_formulas(wide_df, spot_override, intra_date)
 
+    # Ensure index is clean after apply_formulas
+    result = result.reset_index(drop=True)
+
     greek_cols   = ["call_iv","call_delta","call_gamma","call_vanna",
                     "call_charm","call_oi","call_volume",
                     "put_iv","put_delta","put_gamma","put_vanna",
                     "put_charm","put_oi","put_volume"]
     formula_cols = [c for c in result.columns if c.endswith("_$")]
 
-    keep  = (["timestamp","strike","spot_used"] +
-             [c for c in greek_cols   if c in result.columns] +
-             [c for c in formula_cols if c in result.columns])
-    ts_df = result[[c for c in keep if c in result.columns]].copy()
+    # Only keep columns that actually exist after reset
+    available = set(result.columns)
+
+    keep = []
+    for c in (["timestamp", "strike", "spot_used"] +
+              [c for c in greek_cols   if c in available] +
+              [c for c in formula_cols if c in available]):
+        if c in available and c not in keep:
+            keep.append(c)
+
+    ts_df = result[keep].copy()
     ts_df = ts_df.rename(columns={"spot_used": "spot"})
-    ts_df = ts_df.sort_values(["timestamp","strike"]).reset_index(drop=True)
+
+    # Safe sort — only sort by columns that exist
+    sort_cols = [c for c in ["timestamp", "strike"] if c in ts_df.columns]
+    if sort_cols:
+        ts_df = ts_df.sort_values(sort_cols).reset_index(drop=True)
+
     ts_df.rename(columns={c: c.replace("_$", " ($)")
                            for c in formula_cols if c in ts_df.columns},
                  inplace=True)
