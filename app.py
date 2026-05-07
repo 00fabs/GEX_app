@@ -113,28 +113,8 @@ if submitted:
         st.error("No intraday data returned"); st.stop()
     st.success(f"Step 3  {len(df_all):,} rows")
 
-    # ====================== COMPUTE WIDE DF ======================
     with st.spinner("Computing GEX / DEX..."):
         wide_df = pivot_wide(df_all)
-
-    # ── TEMPORARY DIAGNOSTIC — After pivot_wide() ───────────────
-    st.subheader("🔍 Diagnostic: After pivot_wide()")
-    st.write(f"**Shape:** {wide_df.shape}")
-    st.write("**Columns:**", list(wide_df.columns))
-
-    st.write("**Sample rows:**")
-    st.dataframe(wide_df.head(10))
-
-    for c in ["call_oi", "put_oi", "call_gamma", "put_gamma"]:
-        if c in wide_df.columns:
-            non_zero = (wide_df[c] != 0).sum()
-            nulls = wide_df[c].isna().sum()
-            sample = wide_df[c].dropna().head(5).tolist()
-            st.write(f"✅ **{c}** → Non-zero: {non_zero:,} | "
-                     f"Nulls: {nulls} | Sample: {sample}")
-        else:
-            st.error(f"❌ Missing column: **{c}**")
-    # ─────────────────────────────────────────────────────────────
 
     # Continue with normal flow
     ts_table = build_session_table(
@@ -142,6 +122,10 @@ if submitted:
 
     minute_series, sorted_ts, all_strikes, formula_keys = \
         build_minute_series(wide_df, spot_override_input, date_input)
+
+    # Clear stale radio button keys to prevent old selection errors
+    st.session_state.pop("gex_formula_radio", None)
+    st.session_state.pop("dex_formula_radio", None)
 
     st.session_state.update(dict(
         minute_series=minute_series, 
@@ -224,29 +208,26 @@ if st.session_state["computed"]:
 
     tc1, tc2 = st.columns(2)
     with tc1:
-        chart_type = st.radio("Chart", ["GEX", "DEX"], horizontal=True, key="chart_type_radio")
+        chart_type = st.radio(
+            "Chart", ["GEX", "DEX"],
+            horizontal=True, key="chart_type_radio")
     with tc2:
         if chart_type == "GEX":
-            formula_choice = st.radio("GEX Formula", gex_keys, horizontal=True, key="gex_formula_radio")
+            formula_choice = st.radio(
+                "GEX Formula", gex_keys,
+                index=0,
+                horizontal=True, key="gex_formula_radio")
         else:
-            formula_choice = st.radio("DEX Formula", dex_keys, horizontal=True, key="dex_formula_radio")
+            formula_choice = st.radio(
+                "DEX Formula", dex_keys,
+                index=0,
+                horizontal=True, key="dex_formula_radio")
+
+    # Guard against empty selection
+    if not formula_choice:
+        formula_choice = gex_keys[0] if chart_type == "GEX" else dex_keys[0]
 
     fkey = formula_choice
-
-    # ── TEMPORARY DIAGNOSTIC — Before building chart ─────────────
-    st.subheader("🔍 Diagnostic: Before build_histogram_chart()")
-    st.write("**formula_keys:**", formula_keys)
-    st.write("**fkey being used:**", fkey)
-    if all_strikes:
-        first_strike = all_strikes[0]
-        sample_keys = list(ts_data.get(first_strike, {}).keys())
-        sample_value = ts_data.get(first_strike, {}).get(fkey, "KEY NOT FOUND")
-        st.write(f"**First strike:** {first_strike}")
-        st.write("**Sample ts_data keys:**", sample_keys)
-        st.write(f"**Sample value for '{fkey}':**", sample_value)
-    else:
-        st.write("**No strikes available**")
-    # ─────────────────────────────────────────────────────────────
 
     # Build chart data
     chart_data = [{"strike": sk,
