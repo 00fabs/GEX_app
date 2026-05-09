@@ -17,7 +17,7 @@ from pipeline   import (pivot_wide, build_minute_series,
 from chart      import build_histogram_chart
 
 st.set_page_config(page_title="SPX GEX/DEX Analyzer", layout="wide")
-st.title("📊 SPX GEX / DEX Analyzer")
+st.title("SPX GEX / DEX Analyzer")
 
 # ── Radio style ───────────────────────────────────────────────
 st.markdown("""
@@ -48,7 +48,7 @@ st.header("Parameters")
 
 with st.form("params_form"):
     c1, c2, c3 = st.columns(3)
-    api_key     = c1.text_input("iVolatility API Key", type="password",
+    api_key     = c1.text_input("API Key", type="password",
                                  placeholder="Paste your Backtest+ key")
     date_input  = c2.date_input("Session Date", value=date.today())
     minute_type = c3.selectbox("API Bar Resolution",
@@ -61,12 +61,12 @@ with st.form("params_form"):
     spot_override_input = c5.number_input("Spot Override (fallback)",
                                            value=5580.0, step=1.0)
     submitted = st.form_submit_button(
-        "🚀 Fetch & Compute Full Session", use_container_width=True)
+        "Fetch & Compute Full Session", use_container_width=True)
 
 # ── Main pipeline ─────────────────────────────────────────────
 if submitted:
     if not api_key:
-        st.error("Enter your iVolatility API key"); st.stop()
+        st.error("Enter your API key"); st.stop()
 
     date_str      = date_input.strftime("%Y-%m-%d")
     prev_date_str = prev_trading_day(date_input).strftime("%Y-%m-%d")
@@ -139,7 +139,7 @@ if st.session_state["computed"]:
     intra_date   = st.session_state["intra_date"]
 
     st.divider()
-    st.header("📊 GEX / DEX Charts")
+    st.header("GEX / DEX Charts")
 
     # ── Time step controls ────────────────────────────────────
     cc1, cc2, cc3, cc4, cc5 = st.columns([1, 1, 2, 1, 2])
