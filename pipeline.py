@@ -1,7 +1,5 @@
 # ─────────────────────────────────────────────────────────────
 # pipeline.py — pivot, session series builder, table builder
-# Formula keys are read dynamically from formulas.FORMULA_COLS
-# so adding a formula to formulas.py is the only step needed.
 # ─────────────────────────────────────────────────────────────
 import pandas as pd
 import numpy as np
@@ -27,8 +25,7 @@ def pivot_wide(df_all: pd.DataFrame) -> pd.DataFrame:
                   for k, v in COL_MAP.items() if k in df.columns}
         df = df.rename(columns=rename)
         base = (["timestamp", "_strike", "underlyingPrice"]
-                if prefix == "call"
-                else ["timestamp", "_strike"])
+                if prefix == "call" else ["timestamp", "_strike"])
         keep = base + list(rename.values())
         return df[[c for c in keep if c in df.columns]].copy()
 
@@ -36,12 +33,9 @@ def pivot_wide(df_all: pd.DataFrame) -> pd.DataFrame:
     puts_p  = pivot_side(df_all[df_all["_optType"] == "P"].copy(), "put")
 
     merged = calls_p.merge(puts_p, on=["timestamp", "_strike"], how="outer")
-    merged = merged.rename(columns={"_strike": "strike",
-                                    "underlyingPrice": "spot"})
+    merged = merged.rename(columns={"_strike": "strike", "underlyingPrice": "spot"})
 
-    # ── Rolling IV stats for Z-score (20-bar per strike) ─────
-    # Required by apply_formulas for new formulas using call_iv_z / put_iv_z
-    # (e.g. GEX_Call_Demand, GEX_Put_Demand, etc.)
+    # ── Rolling IV stats for Z-score ─────────────────────────────
     eps = 1e-9
     for side in ["call", "put"]:
         iv_col = f"{side}_iv"
@@ -62,17 +56,17 @@ def pivot_wide(df_all: pd.DataFrame) -> pd.DataFrame:
     return merged.sort_values(["timestamp", "strike"]).reset_index(drop=True)
 
 
-def build_minute_series(wide_df: pd.DataFrame,
-                        spot_override: float,
-                        intra_date) -> tuple:
-    """
-    Dynamically reads FORMULA_COLS from formulas.py.
-    Adding a new formula to formulas.py automatically makes it
-    available in the chart and data tables.
-    """
-    result = apply_formulas(wide_df, spot_override, intra_date)
+def build_minute_series(wide_df: pd.DataFrame, spot_override: float, intra_date):
+    try:
+        result = apply_formulas(wide_df, spot_override, intra_date)
+        if result is None:
+            raise ValueError("apply_formulas returned None")
+    except Exception as e:
+        import streamlit as st
+        st.error(f"❌ Error in apply_formulas: {e}")
+        st.exception(e)   # This shows full traceback in Streamlit
+        st.stop()
 
-    # Derive clean key names from FORMULA_COLS
     formula_keys = [c.replace("_$", "") for c in FORMULA_COLS]
 
     series = {}
@@ -89,20 +83,24 @@ def build_minute_series(wide_df: pd.DataFrame,
 
     sorted_ts = sorted(series.keys())
     all_strikes = sorted({sk for ts_data in series.values() for sk in ts_data})
-
     return series, sorted_ts, all_strikes, formula_keys
 
 
-def build_session_table(wide_df: pd.DataFrame,
-                        spot_override: float,
-                        intra_date) -> pd.DataFrame:
-    """Build flat table for display in data tabs."""
-    result = apply_formulas(wide_df, spot_override, intra_date)
+def build_session_table(wide_df: pd.DataFrame, spot_override: float, intra_date):
+    try:
+        result = apply_formulas(wide_df, spot_override, intra_date)
+        if result is None:
+            raise ValueError("apply_formulas returned None")
+    except Exception as e:
+        import streamlit as st
+        st.error(f"❌ Error in apply_formulas: {e}")
+        st.exception(e)
+        st.stop()
 
-    greek_cols = ["call_iv", "call_delta", "call_gamma", "call_vanna",
-                  "call_charm", "call_oi", "call_volume",
-                  "put_iv", "put_delta", "put_gamma", "put_vanna",
-                  "put_charm", "put_oi", "put_volume"]
+    greek_cols = ["call_iv","call_delta","call_gamma","call_vanna",
+                  "call_charm","call_oi","call_volume",
+                  "put_iv","put_delta","put_gamma","put_vanna",
+                  "put_charm","put_oi","put_volume"]
 
     formula_cols = [c for c in result.columns if c.endswith("_$")]
 
@@ -114,9 +112,7 @@ def build_session_table(wide_df: pd.DataFrame,
     ts_df = ts_df.rename(columns={"spot_used": "spot"})
     ts_df = ts_df.sort_values(["timestamp", "strike"]).reset_index(drop=True)
 
-    # Rename for display: "XXX_\( " → "XXX ( \))"
     ts_df.rename(columns={c: c.replace("_\( ", " ( \))") 
                          for c in formula_cols if c in ts_df.columns},
                  inplace=True)
-
     return ts_df
