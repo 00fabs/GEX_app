@@ -1,33 +1,42 @@
 # ─────────────────────────────────────────────────────────────
 # formulas.py — GEX / DEX formula engine
-# All dynamic — no static OI used
+# Dynamic intraday formulas — no static OI dependency
 # All formula column names start with GEX_ or DEX_
 # ─────────────────────────────────────────────────────────────
 import numpy as np
 import pandas as pd
-from collections import defaultdict
 from config import SPX_MULT
 
 FORMULA_COLS = [
-    "GEX_Gamma_IV_$",
-    "GEX_Vanna_IV_$",
-    "GEX_Charm_Flow_$",
-    "GEX_Vol_Skew_$",
-    "DEX_Dynamic_$",
-    "DEX_Vanna_Flow_$",
+    "GEX_Call_Wall_$",
+    "GEX_Put_Wall_$",
+    "GEX_Call_Demand_$",
+    "GEX_Put_Demand_$",
+    "GEX_Wall_Integrity_$",
+    "GEX_Reversal_$",
+    "GEX_Breakout_$",
+    "DEX_Proximity_Flow_$",
 ]
 
 
 def apply_formulas(df: pd.DataFrame, spot_override: float,
                    intra_date) -> pd.DataFrame:
     """
-    Fully dynamic intraday GEX / DEX formulas.
-    No static OI used anywhere — all signals derived from
-    live Greeks, IV, and intraday volume updated every bar.
+    Dynamic intraday GEX / DEX formulas for 0DTE SPX.
+    Uses IV Z-score (20-bar rolling) instead of raw IV change
+    to avoid morning crush contamination and bar-to-bar noise.
+    OI used only for wall classification (static map at open).
+    All dynamic signals use Greeks, IV Z-score, bid pressure,
+    and proximity weighting.
+
+    Requires pipeline.py to have pre-computed per strike:
+        call_iv_mean20, call_iv_std20
+        put_iv_mean20,  put_iv_std20
 
     Parameters
     ----------
     df            : wide DataFrame from pipeline.pivot_wide()
+                    with rolling IV stats pre-computed
     spot_override : fallback spot price
     intra_date    : session date (available for future use)
 
@@ -51,231 +60,413 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
                                  errors="coerce").fillna(0).values
         return np.zeros(len(out))
 
+    # ── Greeks ────────────────────────────────────────────────
     cg    = col("call_gamma")
     pg    = col("put_gamma")
     cv    = col("call_vanna")
     pv    = col("put_vanna")
-    cc    = col("call_charm")
-    pc    = col("put_charm")
     cd    = col("call_delta")
     pd_   = col("put_delta")
     civ   = col("call_iv")
     piv   = col("put_iv")
-    cvol  = col("call_volume")
-    pvol  = col("put_volume")
+    coi   = col("call_oi")
+    poi   = col("put_oi")
+    cbid  = col("call_bid")
+    cask  = col("call_ask")
+    pbid  = col("put_bid")
+    pask  = col("put_ask")
 
-    S     = out["spot_used"].values.astype(float)
-    S2    = S ** 2
-    M     = SPX_MULT
-    eps   = 1e-9
+    # ── Rolling IV stats (pre-computed in pipeline.py) ────────
+    civ_mean = col("call_iv_mean20")
+    civ_std  = col("call_iv_std20")
+    piv_mean = col("put_iv_mean20")
+    piv_std  = col("put_iv_std20")
 
-    gamma_avg  = (cg + pg) / 2.0
-    total_vol  = cvol + pvol
+    S   = out["spot_used"].values.astype(float)
+    S2  = S ** 2
+    M   = SPX_MULT
+    eps = 1e-9
 
     # ═════════════════════════════════════════════════════════
-    # GEX_Gamma_IV  —  Market-priced curvature pressure
+    # BUILDING BLOCKS
+    # ═════════════════════════════════════════════════════════
+
+    # ── IV Z-Score (20-bar rolling per strike) ────────────────
+    #
+    # Measures how abnormal current IV is relative to its own
+    # recent history at each strike. Automatically adjusts for
+    # morning IV crush since the rolling mean tracks the crush
+    # and the Z-score returns to zero once crush stabilises.
+    #
+    # Z > +1.5 → IV abnormally high → genuine demand building
+    # Z < -1.5 → IV abnormally low  → demand fading / closing
+    # |Z| < 1  → normal variation   → no strong signal
+    #
+    # First 20 bars per strike are warmup (min_periods=1 in
+    # pipeline means early bars use whatever data is available
+    # so signal is weaker but not zero).
+    call_iv_z = (civ - civ_mean) / (civ_std + eps)
+    put_iv_z  = (piv - piv_mean) / (piv_std  + eps)
+
+    # ── Bid Pressure (0 to 1 per side) ───────────────────────
+    #
+    # Estimates whether flow is buyer-aggressive (near ask)
+    # or seller-aggressive (near bid) without trade-level data.
+    #
+    # 1.0 = mid at ask  → aggressive buying  → opening pressure
+    # 0.0 = mid at bid  → aggressive selling → closing pressure
+    # 0.5 = mid at mid  → balanced / neutral
+    #
+    # We use (mid - bid) / spread rather than raw volume
+    # because volume cannot distinguish opening from closing.
+    call_mid         = (cbid + cask) / 2.0
+    put_mid          = (pbid + pask) / 2.0
+    call_spread      = cask - cbid + eps
+    put_spread       = pask - pbid + eps
+    call_bid_press   = np.clip((call_mid - cbid) / call_spread, 0, 1)
+    put_bid_press    = np.clip((put_mid  - pbid) / put_spread,  0, 1)
+
+    # ── Proximity Weight ──────────────────────────────────────
+    #
+    # Exponential decay from spot. Signals at strikes far from
+    # spot are downweighted — they are theoretically interesting
+    # but not immediately actionable.
+    #
+    # ATM band = 0.5% of spot (≈35 pts at SPX 7000).
+    # Strike within 5 pts  → weight ≈ 0.87 → strong
+    # Strike at 35 pts     → weight ≈ 0.37 → moderate
+    # Strike at 70 pts     → weight ≈ 0.14 → weak
+    # Strike at 100+ pts   → weight ≈ 0.00 → ignored
+    strikes_arr = col("strike") if "strike" in out.columns \
+                  else np.zeros(len(out))
+    atm_band    = S * 0.005 + eps
+    proximity   = np.exp(-np.abs(strikes_arr - S) / atm_band)
+
+    # ── Wall Classification Weights ───────────────────────────
+    #
+    # Identifies how dominant the call vs put OI is at each
+    # strike relative to total OI. Used to weight signals by
+    # how strongly a strike qualifies as a wall.
+    #
+    # call_wall_w near 1.0 → strong call wall
+    # put_wall_w  near 1.0 → strong put wall
+    # Both near 0.5        → mixed positioning, weaker signal
+    total_oi     = coi + poi + eps
+    call_wall_w  = coi / total_oi   # 0 to 1
+    put_wall_w   = poi / total_oi   # 0 to 1
+
+    # ═════════════════════════════════════════════════════════
+    # GEX_Call_Wall — Call wall magnitude (always positive)
     # ═════════════════════════════════════════════════════════
     #
-    # Replaces static OI with IV as the position weight.
-    # Logic: when call_gamma × call_iv is large at a strike the
-    # market is simultaneously pricing high curvature AND high
-    # uncertainty on the call side. This means the market expects
-    # significant hedging activity there regardless of OI count.
-    # IV is re-priced every minute so this is fully dynamic.
+    # Identifies strikes where call OI is dominant.
+    # Dealers are assumed short these calls (long gamma).
+    # Their hedging OPPOSES price movement → ceiling / resistance.
+    # Price decelerates approaching these strikes from below
+    # because dealers continuously sell into every uptick.
     #
-    # Formula:
-    #   GEX_Gamma_IV = (call_gamma × call_iv
-    #                −  put_gamma  × put_iv) × M × S²
+    # Always POSITIVE so call walls are immediately visible
+    # as upward bars on the histogram.
     #
     # How to read:
-    #   POSITIVE bar → call gamma/IV dominates → ceiling forming
-    #     → dealers sell as spot rallies toward this strike
-    #     → RESISTANCE
-    #   NEGATIVE bar → put gamma/IV dominates → floor forming
-    #     → dealers buy as spot falls toward this strike
-    #     → SUPPORT
-    #   ZERO CROSS nearest spot → gamma flip level
-    #     Above flip → pinning regime → fade moves
-    #     Below flip → trending regime → follow breakouts
-    #   Most reliable of all formulas because IV reflects live
-    #   market maker inventory adjustments every minute.
-    gex_gamma_iv = (cg * civ - pg * piv) * M * S2
-    out["GEX_Gamma_IV"]   = gex_gamma_iv
-    out["GEX_Gamma_IV_$"] = gex_gamma_iv / 1e9
-
-    # ═════════════════════════════════════════════════════════
-    # GEX_Vanna_IV  —  IV-move driven rehedging pressure
-    # ═════════════════════════════════════════════════════════
-    #
-    # Vanna measures how delta changes when IV changes.
-    # When IV moves (which it does constantly intraday) dealers
-    # must rehedge delta proportional to their vanna exposure.
-    # Multiplying by IV amplifies strikes where the market is
-    # pricing both high vanna sensitivity AND high uncertainty —
-    # those are the strikes where IV-driven rehedging will be
-    # largest. Static OI completely misses this channel.
+    #   Tallest positive bar = strongest ceiling for the session.
+    #   This is your primary resistance target.
+    #   Price approaching from below will slow and may stall here.
+    #   Watch GEX_Breakout at this strike for flip risk.
+    #   Watch GEX_Reversal at this strike for rejection confirmation.
     #
     # Formula:
-    #   GEX_Vanna_IV = (call_vanna × call_iv
-    #                −  put_vanna  × put_iv) × M × S²
-    #
-    # How to read:
-    #   Most powerful around events that move IV intraday:
-    #   economic data, Fed speakers, unexpected news.
-    #   POSITIVE → rising IV forces dealer buying → bullish support
-    #   NEGATIVE → rising IV forces dealer selling → bearish resistance
-    #   Use alongside GEX_Gamma_IV:
-    #     Both positive at same strike → strong confirmed ceiling
-    #     Both negative at same strike → strong confirmed floor
-    #     Divergence → mixed signal, reduce confidence
-    gex_vanna_iv = (cv * civ - pv * piv) * M * S2
-    out["GEX_Vanna_IV"]   = gex_vanna_iv
-    out["GEX_Vanna_IV_$"] = gex_vanna_iv / 1e9
+    #   call_gamma × call_oi × M × S²
+    gex_call_wall = cg * coi * M * S2
+    out["GEX_Call_Wall"]   = gex_call_wall
+    out["GEX_Call_Wall_$"] = gex_call_wall / 1e9
 
     # ═════════════════════════════════════════════════════════
-    # GEX_Charm_Flow  —  Time-decay rehedging (0DTE specific)
+    # GEX_Put_Wall — Put wall magnitude (always negative)
     # ═════════════════════════════════════════════════════════
     #
-    # THE most 0DTE-specific formula in the set.
-    # Charm = rate of delta decay with time (dDelta/dTime).
-    # For 0DTE charm is enormous near ATM and accelerates
-    # exponentially as expiration approaches.
-    # Every minute that passes dealers MUST rehedge delta
-    # proportional to charm regardless of spot movement.
-    # This creates predictable mechanical buying/selling flows
-    # purely from time passage — not directional speculation.
-    # Multiplying by volume confirms which strikes are seeing
-    # actual flow vs theoretical exposure.
+    # Identifies strikes where put OI is dominant.
+    # Dealers are assumed short these puts (long gamma).
+    # Their hedging OPPOSES downward movement → floor / support.
+    # Price approaches put walls FAST (falling markets have
+    # higher momentum and put delta accelerates faster due
+    # to skew) but dealers are buying into every downtick.
     #
-    # Formula:
-    #   GEX_Charm_Flow = (call_charm × call_volume
-    #                  −  put_charm  × put_volume) × M × S²
+    # Always NEGATIVE so put walls are immediately visible
+    # as downward bars — clearly separated from call walls.
     #
     # How to read:
-    #   Grows in importance as session progresses.
-    #   Largest bars after 2pm are the strongest expiration magnets.
-    #   POSITIVE → call charm flow dominates → time-decay buying
-    #     → bullish drift toward this strike into close
-    #   NEGATIVE → put charm flow dominates → time-decay selling
-    #     → bearish drift toward this strike into close
-    #   Near zero early session = few contracts traded yet.
-    #   Diverges from GEX_Gamma_IV as day progresses = watch
-    #   the divergence strikes carefully — those are where the
-    #   afternoon pin battle will be fought.
-    gex_charm_flow = (cc * cvol - pc * pvol) * M * S2
-    out["GEX_Charm_Flow"]   = gex_charm_flow
-    out["GEX_Charm_Flow_$"] = gex_charm_flow / 1e9
+    #   Largest negative bar = strongest floor for the session.
+    #   This is your primary support target.
+    #   Price approaching from above will be met with dealer buying.
+    #   Watch GEX_Breakout at this strike for breakdown risk.
+    #   Watch GEX_Reversal at this strike for bounce confirmation.
+    #
+    # Formula:
+    #   −(put_gamma × put_oi × M × S²)
+    gex_put_wall = -(pg * poi * M * S2)
+    out["GEX_Put_Wall"]   = gex_put_wall
+    out["GEX_Put_Wall_$"] = gex_put_wall / 1e9
 
     # ═════════════════════════════════════════════════════════
-    # GEX_Vol_Skew  —  Volume + IV skew combined pressure
+    # GEX_Call_Demand — Call buying pressure (dynamic)
     # ═════════════════════════════════════════════════════════
     #
-    # Combines three live signals into one:
-    #   1. gamma_avg    — curvature at this strike
-    #   2. IV_skew      — which side market pays more for
-    #   3. total_volume — where actual trading is happening
+    # Detects genuine call demand building at each strike using
+    # three independent live signals multiplied together:
     #
-    # IV skew per strike:
-    #   IV_skew = (put_iv − call_iv) / (put_iv + call_iv + ε)
-    #   +1 = pure put IV premium (fear of downside)
-    #   -1 = pure call IV premium (fear of upside)
-    #    0 = balanced
+    #   1. call_iv_z     — IV abnormally high vs recent history
+    #                      (Z-score, 20-bar rolling per strike)
+    #                      Confirms demand is real not just noise
     #
-    # Formula:
-    #   GEX_Vol_Skew = gamma_avg × IV_skew × total_volume × M × S²
+    #   2. call_vanna    — How much delta changes when IV moves
+    #                      High vanna = dealers rehedging heavily
+    #                      as this call demand builds
+    #
+    #   3. call_bid_press — Flow closer to ask = buyers aggressive
+    #                       Flow closer to bid = sellers / closers
+    #                       Distinguishes opening from closing flow
+    #
+    #   4. proximity     — Downweights far strikes automatically
+    #
+    # Signal is only strong when ALL THREE agree:
+    #   IV abnormally high + vanna active + buyers at ask + near spot
     #
     # How to read:
-    #   POSITIVE → put IV premium + volume at this strike
-    #     → market paying for downside protection here
-    #     → dealers short puts → FLOOR / SUPPORT
-    #   NEGATIVE → call IV premium + volume at this strike
-    #     → market paying for upside protection here
-    #     → dealers short calls → CEILING / RESISTANCE
-    #   Zero volume early session → bars near flat, grows through day
-    #   Best used from 11am onward when volume has accumulated.
-    #   Compare with GEX_Charm_Flow: if both point to same strike
-    #   that is your highest-confidence level of the session.
-    iv_skew      = (piv - civ) / (piv + civ + eps)
-    gex_vol_skew = gamma_avg * iv_skew * total_vol * M * S2
-    out["GEX_Vol_Skew"]   = gex_vol_skew
-    out["GEX_Vol_Skew_$"] = gex_vol_skew / 1e9
+    #   At a CALL WALL → rising GEX_Call_Demand = BREAKOUT risk
+    #     Gamma flipping from stabilising to destabilising
+    #     Dealers transitioning from selling to buying with move
+    #
+    #   At a PUT WALL → rising GEX_Call_Demand = REVERSAL signal
+    #     Buyers positioning for bounce at exact support level
+    #     Double dealer buying: short put hedge + new short call hedge
+    #     Strongest reversal signal when GEX_Put_Wall is large negative
+    #
+    # Zero or flat → no demand signal → wall holding passively
+    # Spikes → imminent transition → watch next 3-5 bars
+    gex_call_demand = (call_iv_z * cv * call_bid_press
+                       * proximity * M * S2)
+    out["GEX_Call_Demand"]   = gex_call_demand
+    out["GEX_Call_Demand_$"] = gex_call_demand / 1e9
 
     # ═════════════════════════════════════════════════════════
-    # DEX_Dynamic  —  Live delta exposure from actual flow
+    # GEX_Put_Demand — Put buying pressure (dynamic)
     # ═════════════════════════════════════════════════════════
     #
-    # Standard DEX uses static OI which is stale for 0DTE.
-    # DEX_Dynamic replaces OI with intraday volume so it
-    # reflects today's actual directional hedging requirement
-    # from contracts that have actually traded this session.
-    # Put delta is already negative from BSM so the formula
-    # naturally nets directional exposure.
+    # Mirror of GEX_Call_Demand for the put side.
+    # Detects genuine put demand building using:
     #
-    # Formula:
-    #   DEX_Dynamic = (call_delta × call_volume
-    #               +  put_delta  × put_volume) × M × S
+    #   1. put_iv_z      — Put IV abnormally high vs recent history
+    #   2. put_vanna     — Delta rehedging sensitivity to IV move
+    #   3. put_bid_press — Buyers aggressive at ask vs closers at bid
+    #   4. proximity     — Near-spot weighting
+    #
+    # Plotted as NEGATIVE values so put demand reads downward
+    # on the chart — directionally consistent with put walls.
     #
     # How to read:
-    #   POSITIVE → call delta flow dominates → dealers net short
-    #     delta from today's trades → they BUY as price rises
-    #     → bullish attractor / dynamic support
-    #   NEGATIVE → put delta flow dominates → dealers net long
-    #     delta → they SELL as price rises
-    #     → bearish attractor / dynamic resistance
-    #   The zero cross of DEX_Dynamic is a secondary flip level
-    #   for delta hedging — less powerful than GEX_Gamma_IV
-    #   flip but confirms the directional bias when aligned.
-    dex_dynamic = (cd * cvol + pd_ * pvol) * M * S
-    out["DEX_Dynamic"]   = dex_dynamic
-    out["DEX_Dynamic_$"] = dex_dynamic / 1e9
+    #   At a PUT WALL → rising |GEX_Put_Demand| = BREAKDOWN risk
+    #     More puts being bought at already-heavy put strike
+    #     Gamma flipping: dealers transition to selling with move
+    #     Price will approach fast AND dealers amplify the fall
+    #
+    #   At a CALL WALL → rising |GEX_Put_Demand| = REVERSAL signal
+    #     Buyers positioning for rejection at exact resistance
+    #     Double dealer selling: short call hedge + new short put hedge
+    #     Strongest reversal signal when GEX_Call_Wall is large positive
+    #
+    # Zero → no put demand → wall holding or no wall present
+    gex_put_demand = -(put_iv_z * pv * put_bid_press
+                       * proximity * M * S2)
+    out["GEX_Put_Demand"]   = gex_put_demand
+    out["GEX_Put_Demand_$"] = gex_put_demand / 1e9
 
     # ═════════════════════════════════════════════════════════
-    # DEX_Vanna_Flow  —  IV-sensitivity weighted delta flow
+    # GEX_Wall_Integrity — Net wall holding power per strike
     # ═════════════════════════════════════════════════════════
     #
-    # Measures the delta hedging that will be TRIGGERED BY IV
-    # moves rather than spot moves. When IV rises or falls,
-    # dealers must rehedge delta proportional to their vanna.
-    # Multiplying by volume confirms where this is actually
-    # happening vs theoretical.
+    # Combines the static wall strength with the dynamic demand
+    # signals to produce a single reading of whether a wall is
+    # holding or breaking down at each strike.
     #
     # Formula:
-    #   DEX_Vanna_Flow = (call_vanna × call_volume
-    #                  −  put_vanna  × put_volume) × M × S
+    #   At call-dominant strikes (call_wall_w > 0.5):
+    #     Integrity = GEX_Call_Wall − GEX_Call_Demand × call_wall_w
+    #                 + GEX_Put_Demand × call_wall_w
+    #
+    #   At put-dominant strikes (put_wall_w > 0.5):
+    #     Integrity = GEX_Put_Wall + GEX_Put_Demand × put_wall_w
+    #                 − GEX_Call_Demand × put_wall_w
+    #
+    # Unified formula (works continuously across all strikes):
+    #   Integrity = (call_wall_w × GEX_Call_Wall
+    #              + put_wall_w  × GEX_Put_Wall)
+    #             − (call_wall_w × GEX_Call_Demand)   ← same-side erodes
+    #             + (call_wall_w × GEX_Put_Demand)    ← opposite strengthens
+    #             + (put_wall_w  × GEX_Put_Demand)    ← same-side erodes
+    #             − (put_wall_w  × GEX_Call_Demand)   ← opposite strengthens
     #
     # How to read:
-    #   POSITIVE → call vanna flow → rising IV forces dealer
-    #     delta buying at this strike → bullish IV-driven support
-    #   NEGATIVE → put vanna flow → rising IV forces dealer
-    #     delta selling → bearish IV-driven resistance
-    #   Most useful when IV is moving intraday (check GEX_Vanna_IV
-    #   alongside this). If IV is flat DEX_Vanna_Flow is secondary.
-    #   When IV is spiking this becomes the primary signal because
-    #   it captures the exact strikes where forced rehedging occurs.
-    dex_vanna_flow = (cv * cvol - pv * pvol) * M * S
-    out["DEX_Vanna_Flow"]   = dex_vanna_flow
-    out["DEX_Vanna_Flow_$"] = dex_vanna_flow / 1e9
+    #   POSITIVE → wall holding → compression/support active
+    #     Fade moves toward this strike
+    #     Price likely to stall or reverse here
+    #
+    #   NEGATIVE → wall breaking → flip/breakdown underway
+    #     Do not fade — follow the move through this strike
+    #     Confirm with GEX_Breakout or GEX_Reversal
+    #
+    #   ZERO CROSS (positive → negative) = transition point
+    #     Most actionable signal on the chart
+    #     Enter on next bar after zero cross confirmed
+    base_integrity  = (call_wall_w * gex_call_wall
+                       + put_wall_w * gex_put_wall)
+    demand_erosion  = (call_wall_w * gex_call_demand
+                       + put_wall_w * gex_put_demand)
+    opposite_demand = (call_wall_w * gex_put_demand
+                       + put_wall_w * gex_call_demand)
+
+    gex_wall_integrity = base_integrity - demand_erosion + opposite_demand
+    out["GEX_Wall_Integrity"]   = gex_wall_integrity
+    out["GEX_Wall_Integrity_$"] = gex_wall_integrity / 1e9
+
+    # ═════════════════════════════════════════════════════════
+    # GEX_Reversal — Opposite-side demand at wall (reversal)
+    # ═════════════════════════════════════════════════════════
+    #
+    # Isolates the pure reversal signal: demand building on the
+    # OPPOSITE side from the dominant wall at each strike,
+    # weighted by how strong the existing wall is and how close
+    # price is to the strike.
+    #
+    # Logic:
+    #   At a CALL WALL: put demand building = reversal down signal
+    #     Buyers positioning for rejection at resistance
+    #     Combined dealer selling = amplified reversal
+    #
+    #   At a PUT WALL: call demand building = reversal up signal
+    #     Buyers positioning for bounce at support
+    #     Combined dealer buying = amplified reversal
+    #
+    # Formula:
+    #   GEX_Reversal = call_wall_w × |GEX_Put_Demand|  (at call walls)
+    #                + put_wall_w  × |GEX_Call_Demand| (at put walls)
+    #   × proximity × wall_magnitude_weight
+    #
+    # Always POSITIVE — magnitude shows reversal conviction.
+    # Zero = no reversal signal at this strike.
+    # Large = strong reversal positioning confirmed.
+    #
+    # How to use:
+    #   Step 1: Find largest GEX_Call_Wall or GEX_Put_Wall near spot
+    #   Step 2: Check GEX_Reversal at that same strike
+    #   Step 3: If GEX_Reversal rising as price approaches → fade the move
+    #   Step 4: Confirm with DEX_Proximity_Flow direction
+    wall_magnitude = np.abs(gex_call_wall) + np.abs(gex_put_wall) + eps
+    wall_mag_norm  = wall_magnitude / (wall_magnitude.max() + eps)
+
+    gex_reversal = (call_wall_w * np.abs(gex_put_demand)
+                    + put_wall_w * np.abs(gex_call_demand)) \
+                   * proximity * wall_mag_norm * M
+    out["GEX_Reversal"]   = gex_reversal
+    out["GEX_Reversal_$"] = gex_reversal / 1e9
+
+    # ═════════════════════════════════════════════════════════
+    # GEX_Breakout — Same-side demand at wall (breakout)
+    # ═════════════════════════════════════════════════════════
+    #
+    # Isolates the pure breakout signal: demand building on the
+    # SAME side as the dominant wall at each strike, indicating
+    # the wall is about to flip from stabilising to destabilising.
+    #
+    # Logic:
+    #   At a CALL WALL: call demand building = breakout up signal
+    #     Gamma flipping: dealers go from selling to buying rallies
+    #     Wall becomes rocket fuel instead of ceiling
+    #
+    #   At a PUT WALL: put demand building = breakdown signal
+    #     Gamma flipping: dealers go from buying to selling declines
+    #     Wall becomes accelerant instead of floor
+    #
+    # Formula:
+    #   GEX_Breakout = call_wall_w × |GEX_Call_Demand| (at call walls)
+    #                + put_wall_w  × |GEX_Put_Demand|  (at put walls)
+    #   × proximity × wall_magnitude_weight
+    #
+    # Always POSITIVE — magnitude shows breakout conviction.
+    # Zero = no breakout signal.
+    # Large = wall flip imminent, do not fade.
+    #
+    # How to use alongside GEX_Reversal:
+    #   GEX_Reversal > GEX_Breakout → fade the wall
+    #   GEX_Breakout > GEX_Reversal → follow the break
+    #   Both large → conflicted, wait for one to dominate
+    #   Both near zero → wall passive, no imminent move
+    gex_breakout = (call_wall_w * np.abs(gex_call_demand)
+                    + put_wall_w * np.abs(gex_put_demand)) \
+                   * proximity * wall_mag_norm * M
+    out["GEX_Breakout"]   = gex_breakout
+    out["GEX_Breakout_$"] = gex_breakout / 1e9
+
+    # ═════════════════════════════════════════════════════════
+    # DEX_Proximity_Flow — Directional delta flow near spot
+    # ═════════════════════════════════════════════════════════
+    #
+    # Measures net directional hedging pressure from bid-side
+    # flow at strikes near spot. Confirms the direction implied
+    # by the GEX wall signals without relying on volume counts.
+    #
+    # Formula:
+    #   DEX_Proximity_Flow =
+    #     (call_delta × call_bid_press
+    #    − put_delta  × put_bid_press)   ← put_delta already negative
+    #     × proximity × M × S
+    #
+    # Note: put_delta from BSM is already negative so subtracting
+    # a negative bid pressure term means put buying ADDS to the
+    # negative directional reading — directionally consistent.
+    #
+    # How to read:
+    #   POSITIVE → net call bid pressure near spot
+    #     Buyers lifting calls aggressively close to current price
+    #     Confirms bullish bias / reversal up at put wall
+    #     Confirms breakout up at call wall
+    #
+    #   NEGATIVE → net put bid pressure near spot
+    #     Buyers lifting puts aggressively close to current price
+    #     Confirms bearish bias / reversal down at call wall
+    #     Confirms breakdown at put wall
+    #
+    #   Use as final confirmation:
+    #     GEX signal points up + DEX_Proximity_Flow positive = high confidence
+    #     GEX signal points up + DEX_Proximity_Flow negative = wait / reduce size
+    dex_proximity_flow = ((cd * call_bid_press
+                           - pd_ * put_bid_press)
+                          * proximity * M * S)
+    out["DEX_Proximity_Flow"]   = dex_proximity_flow
+    out["DEX_Proximity_Flow_$"] = dex_proximity_flow / 1e9
 
     # ─────────────────────────────────────────────────────────
     # ADD NEW FORMULAS BELOW THIS LINE
-    # All inputs available as numpy arrays:
-    #   cg, pg       — call/put gamma
-    #   cv, pv       — call/put vanna
-    #   cc, pc       — call/put charm
-    #   cd, pd_      — call/put delta
-    #   civ, piv     — call/put IV
-    #   cvol, pvol   — call/put intraday volume
-    #   S, S2        — spot, spot squared
-    #   M            — multiplier (100)
-    #   gamma_avg    — (cg+pg)/2
-    #   total_vol    — cvol+pvol
-    #   iv_skew      — (piv-civ)/(piv+civ+eps)
+    #
+    # Available numpy arrays:
+    #   cg, pg          call/put gamma
+    #   cv, pv          call/put vanna
+    #   cd, pd_         call/put delta
+    #   civ, piv        call/put IV
+    #   coi, poi        call/put OI (static — use only for classification)
+    #   cbid,cask       call bid/ask
+    #   pbid,pask       put bid/ask
+    #   call_iv_z       call IV Z-score (20-bar rolling)
+    #   put_iv_z        put IV Z-score (20-bar rolling)
+    #   call_bid_press  call bid pressure 0-1
+    #   put_bid_press   put bid pressure 0-1
+    #   proximity       exponential spot proximity weight
+    #   call_wall_w     call wall dominance weight 0-1
+    #   put_wall_w      put wall dominance weight 0-1
+    #   S, S2           spot, spot squared
+    #   M               multiplier (100)
+    #   eps             small constant for division safety
     #
     # Template:
     #   arr = <numpy expression>
-    #   out["GEX_MY_FORMULA"]   = arr
-    #   out["GEX_MY_FORMULA_$"] = arr / 1e9
-    # Then add "GEX_MY_FORMULA_$" to FORMULA_COLS at the top.
-    # ─────────────────────────────────────────────────────────
-
-    return out
+    #   out["GEX_MY_FO
