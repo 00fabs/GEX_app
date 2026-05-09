@@ -469,4 +469,9 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     #
     # Template:
     #   arr = <numpy expression>
-    #   out["GEX_MY_FO
+    #   out["GEX_MY_FORMULA"]   = arr
+    #   out["GEX_MY_FORMULA_$"] = arr / 1e9
+    #   Then add "GEX_MY_FORMULA_$" to FORMULA_COLS at the top.
+    # ─────────────────────────────────────────────────────────
+
+    return out
