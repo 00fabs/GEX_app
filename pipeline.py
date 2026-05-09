@@ -18,7 +18,7 @@ COL_MAP = {
 # reversal and breakout columns to remove bar-to-bar noise.
 # α=0.2 ≈ 5-bar effective memory. Increase toward 0.3 for
 # faster reaction, decrease toward 0.1 for smoother signal.
-EWMA_ALPHA = 0.2
+EWMA_ALPHA = 0.3
 
 # Columns to smooth — must end in _$ and exist in output
 EWMA_COLS = [
