@@ -440,7 +440,7 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     #     GEX signal points up + DEX_Proximity_Flow positive = high confidence
     #     GEX signal points up + DEX_Proximity_Flow negative = wait / reduce size
     dex_proximity_flow = ((cd * call_bid_press
-                           - pd_ * put_bid_press)
+                           + pd_ * put_bid_press)
                           * proximity * M * S)
     out["DEX_Proximity_Flow"]   = dex_proximity_flow
     out["DEX_Proximity_Flow_$"] = dex_proximity_flow / 1e9
