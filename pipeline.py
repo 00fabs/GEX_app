@@ -26,6 +26,8 @@ EWMA_COLS = [
     "GEX_Put_Demand_$",
     "GEX_Reversal_$",
     "GEX_Breakout_$",
+    "GEX_Reversal_Near_$",
+    "GEX_Breakout_Near_$",
 ]
 
 
