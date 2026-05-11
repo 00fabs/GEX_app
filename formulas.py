@@ -41,26 +41,20 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     pv    = col("put_vanna")
     cc    = col("call_charm")
     pc    = col("put_charm")
-    cd    = col("call_delta")
-    pd_   = col("put_delta")
-    civ   = col("call_iv")
-    piv   = col("put_iv")
-    coi   = col("call_oi")
-    poi   = col("put_oi")
     cbid  = col("call_bid")
     cask  = col("call_ask")
     pbid  = col("put_bid")
     pask  = col("put_ask")
-    cvol  = col("call_volume")
-    pvol  = col("put_volume")
+    civ   = col("call_iv")
+    piv   = col("put_iv")
+
+    open_coi = col("session_open_call_oi")
+    open_poi = col("session_open_put_oi")
 
     civ_mean = col("call_iv_mean20")
     civ_std  = col("call_iv_std20")
     piv_mean = col("put_iv_mean20")
     piv_std  = col("put_iv_std20")
-
-    open_coi = col("session_open_call_oi")
-    open_poi = col("session_open_put_oi")
 
     S           = out["spot_used"].values.astype(float)
     S2          = S ** 2
@@ -83,18 +77,16 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     call_bid_press = np.clip((call_mid - cbid) / call_spread, 0, 1)
     put_bid_press  = np.clip((put_mid  - pbid) / put_spread,  0, 1)
 
-    # ── Proximity (wide 0.5% and tight 0.1%) ─────────────────
+    # ── Proximity ─────────────────────────────────────────────
     atm_band_wide  = S * 0.005 + eps
     atm_band_tight = S * 0.001 + eps
     proximity_wide  = np.exp(-np.abs(strikes_arr - S) / atm_band_wide)
     proximity_tight = np.exp(-np.abs(strikes_arr - S) / atm_band_tight)
 
-    # ── Blended weight (40% OI magnitude, 60% proximity) ─────
-    total_open_oi   = open_coi + open_poi + eps
-    max_open_oi     = total_open_oi.max() + eps
-    wall_mag_norm   = total_open_oi / max_open_oi
-    prox_norm       = proximity_wide / (proximity_wide.max() + eps)
-    blended_weight  = (wall_mag_norm * 0.4) + (prox_norm * 0.6)
+    # ── Wall magnitude — strictly OI based ───────────────────
+    total_open_oi = open_coi + open_poi + eps
+    max_open_oi   = total_open_oi.max() + eps
+    wall_mag_norm = total_open_oi / max_open_oi
 
     # ── Hard wall classification ──────────────────────────────
     call_wall_flag = np.where(open_coi > open_poi * 1.5, 1.0,
@@ -112,10 +104,12 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     out["GEX_Put_Wall_$"] = gex_put_wall / 1e9
 
     # ── GEX_Call_Demand ───────────────────────────────────────
+    # wall_mag_norm anchors to OI-significant strikes only
+    # same formula as the last working version
     gex_call_demand          = np.abs(iv_call_edge * cv
                                       * call_bid_press
                                       * proximity_wide
-                                      * blended_weight
+                                      * wall_mag_norm
                                       * M * S2)
     out["GEX_Call_Demand"]   = gex_call_demand
     out["GEX_Call_Demand_$"] = gex_call_demand / 1e9
@@ -124,37 +118,41 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     gex_put_demand          = np.abs(iv_put_edge * pv
                                      * put_bid_press
                                      * proximity_wide
-                                     * blended_weight
+                                     * wall_mag_norm
                                      * M * S2)
     out["GEX_Put_Demand"]   = gex_put_demand
     out["GEX_Put_Demand_$"] = gex_put_demand / 1e9
 
-    # ── GEX_Reversal (wide — structural signal) ───────────────
-    wall_mag_safe  = wall_mag_norm + eps
-    gex_reversal   = np.abs(call_wall_flag * gex_put_demand
-                            + put_wall_flag * gex_call_demand) \
-                     * proximity_wide * wall_mag_safe
+    # ── GEX_Reversal (wide — structural) ─────────────────────
+    wall_mag_safe = wall_mag_norm + eps
+    gex_reversal  = np.abs(call_wall_flag * gex_put_demand
+                           + put_wall_flag * gex_call_demand) \
+                    * proximity_wide * wall_mag_safe
     out["GEX_Reversal"]   = gex_reversal
     out["GEX_Reversal_$"] = gex_reversal / 1e9
 
-    # ── GEX_Breakout (wide — structural signal) ───────────────
-    gex_breakout   = np.abs(call_wall_flag * gex_call_demand
-                            + put_wall_flag * gex_put_demand) \
-                     * proximity_wide * wall_mag_safe
+    # ── GEX_Breakout (wide — structural) ─────────────────────
+    gex_breakout  = np.abs(call_wall_flag * gex_call_demand
+                           + put_wall_flag * gex_put_demand) \
+                    * proximity_wide * wall_mag_safe
     out["GEX_Breakout"]   = gex_breakout
     out["GEX_Breakout_$"] = gex_breakout / 1e9
 
-    # ── GEX_Reversal_Near (tight — entry timing signal) ───────
-    gex_reversal_near   = np.abs(call_wall_flag * gex_put_demand
-                                 + put_wall_flag * gex_call_demand) \
-                          * proximity_tight * wall_mag_safe
+    # ── GEX_Reversal_Near and GEX_Breakout_Near ───────────────
+    # Computed here using raw (pre-EWMA) demand values.
+    # pipeline._apply_ewma() will smooth these after the fact
+    # using the same EWMA_COLS list — add them there too.
+    # Using tight proximity so only fires when spot is within
+    # ~7 points of the strike.
+    gex_reversal_near = np.abs(call_wall_flag * gex_put_demand
+                               + put_wall_flag * gex_call_demand) \
+                        * proximity_tight * wall_mag_safe
     out["GEX_Reversal_Near"]   = gex_reversal_near
     out["GEX_Reversal_Near_$"] = gex_reversal_near / 1e9
 
-    # ── GEX_Breakout_Near (tight — entry timing signal) ───────
-    gex_breakout_near   = np.abs(call_wall_flag * gex_call_demand
-                                 + put_wall_flag * gex_put_demand) \
-                          * proximity_tight * wall_mag_safe
+    gex_breakout_near = np.abs(call_wall_flag * gex_call_demand
+                               + put_wall_flag * gex_put_demand) \
+                        * proximity_tight * wall_mag_safe
     out["GEX_Breakout_Near"]   = gex_breakout_near
     out["GEX_Breakout_Near_$"] = gex_breakout_near / 1e9
 
@@ -165,26 +163,26 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     out["GEX_Charm_Pin"]   = gex_charm_pin
     out["GEX_Charm_Pin_$"] = gex_charm_pin / 1e9
 
-    # ── GEX_Call_OI — raw call OI per strike (positive bars) ──
-    gex_call_oi          = open_coi.astype(float)
-    out["GEX_Call_OI"]   = gex_call_oi
-    out["GEX_Call_OI_$"] = gex_call_oi / 1e6
+    # ── DEX_Call_OI — raw call OI (positive bars) ─────────────
+    dex_call_oi          = open_coi.astype(float)
+    out["DEX_Call_OI"]   = dex_call_oi
+    out["DEX_Call_OI_$"] = dex_call_oi / 1e6
 
-    # ── GEX_Put_OI — raw put OI per strike (negative bars) ────
-    gex_put_oi          = -open_poi.astype(float)
-    out["GEX_Put_OI"]   = gex_put_oi
-    out["GEX_Put_OI_$"] = gex_put_oi / 1e6
+    # ── DEX_Put_OI — raw put OI (negative bars) ───────────────
+    dex_put_oi          = -open_poi.astype(float)
+    out["DEX_Put_OI"]   = dex_put_oi
+    out["DEX_Put_OI_$"] = dex_put_oi / 1e6
 
     # ─────────────────────────────────────────────────────────
     # ADD NEW FORMULAS BELOW THIS LINE
-    # Available arrays: cg, pg, cv, pv, cc, pc, cd, pd_,
-    # civ, piv, coi, poi, open_coi, open_poi,
-    # cbid, cask, pbid, pask, cvol, pvol,
+    # Available arrays: cg, pg, cv, pv, cc, pc,
+    # civ, piv, open_coi, open_poi,
+    # cbid, cask, pbid, pask,
     # call_iv_z, put_iv_z, iv_call_edge, iv_put_edge,
     # call_bid_press, put_bid_press,
     # proximity_wide, proximity_tight,
     # call_wall_flag, put_wall_flag,
-    # wall_mag_norm, blended_weight,
+    # wall_mag_norm, wall_mag_safe,
     # S, S2, M, eps
     #
     # Template:
