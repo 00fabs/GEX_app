@@ -67,6 +67,20 @@ def pivot_wide(df_all: pd.DataFrame) -> pd.DataFrame:
             merged[f"{side}_iv_mean20"] = 0.0
             merged[f"{side}_iv_std20"]  = eps
 
+    # ── Rolling IV slope (5-bar per strike) ───────────────────
+    # Used by _apply_regime_signals for trend confirmation.
+    # Slope computed as difference between current and 5-bar-ago
+    # IV — positive = IV trending up = demand accumulating.
+    for side in ["call", "put"]:
+        iv_col = f"{side}_iv"
+        if iv_col in merged.columns:
+            merged[f"{side}_iv_slope5"] = (
+                merged.groupby("strike")[iv_col]
+                      .transform(lambda x:
+                          x - x.shift(5).fillna(method="bfill")))
+        else:
+            merged[f"{side}_iv_slope5"] = 0.0
+
     # ── Session-open OI snapshot ──────────────────────────────
     for side in ["call", "put"]:
         oi_col = f"{side}_oi"
@@ -101,21 +115,37 @@ def _apply_ewma(result: pd.DataFrame) -> pd.DataFrame:
 
 def _apply_spot_signals(result: pd.DataFrame) -> pd.DataFrame:
     """
-    Computes GEX_Spot_Reversal and GEX_Spot_Breakout per bar.
+    Computes GEX_Spot_Reversal and GEX_Spot_Breakout using the
+    gamma flip strike as the signal location anchor.
 
-    Logic per timestamp:
-      1. Find which wall spot is closer to — call wall above
-         or put wall below. Only that wall's context is active.
-      2. Read EWMA-smoothed call and put demand at ATM strike.
-      3. Compute dominance ratio — which demand side is larger.
-      4. Spot_Reversal = opposite-side dominance × approach weight × total demand
-         Spot_Breakout = same-side dominance    × approach weight × total demand
-      5. Subtract competing signal so only the dominant side shows.
-         Both drop to zero when demand is balanced — correct neutral signal.
-      6. Assign result to ATM strike row only. All other strikes zero.
+    Per timestamp bar:
+      1. Compute net dealer gamma per strike:
+             net_gamma = call_gamma × call_oi − put_gamma × put_oi
+         Positive = call gamma dominates = ceiling
+         Negative = put gamma dominates  = floor
 
-    This ensures only one signal can dominate at a time and both
-    cannot be simultaneously large unless demand is genuinely equal.
+      2. Find the gamma flip strike — the strike nearest to spot
+         where net_gamma crosses zero. This is the structural
+         transition point where dealer behavior changes.
+         Price reacts here before reaching the wall itself.
+         This is why 7245 moves before 7250 — the flip is at
+         7245 even though the wall OI peaks at 7250.
+
+      3. Compute IV trend confirmation at the flip strike using
+         the 5-bar IV slope. Rising put IV slope = reversal
+         pressure building. Rising call IV slope = breakout
+         pressure building.
+
+      4. Apply dominance ratio — only the dominant side shows.
+         Net signal = dominant − competing, clipped to zero.
+         Both drop near zero when balanced = neutral/wait signal.
+
+      5. Weight by how close spot is to the flip strike using
+         a 0.5% proximity band — signal grows as spot approaches
+         the flip level and fades when spot moves away.
+
+      6. Assign signal to the flip strike row only.
+         All other strikes remain zero.
     """
     df  = result.copy()
     eps = 1e-9
@@ -128,24 +158,21 @@ def _apply_spot_signals(result: pd.DataFrame) -> pd.DataFrame:
     if "GEX_Spot_Breakout_$" not in df.columns:
         df["GEX_Spot_Breakout_$"] = 0.0
 
-    # Reset both columns to zero before filling
     df["GEX_Spot_Reversal_$"] = 0.0
     df["GEX_Spot_Breakout_$"] = 0.0
 
     df = df.sort_values(["timestamp", "strike"]).reset_index(drop=True)
 
-    # Wall approach band — 1% of spot
-    # Signal builds gradually as spot closes in on wall
-    ATM_BAND_APPROACH = 0.01
+    PROXIMITY_BAND = 0.005   # 0.5% of spot
 
     for ts in df["timestamp"].unique():
         mask = df["timestamp"] == ts
         grp  = df[mask].copy()
 
-        if len(grp) == 0:
+        if len(grp) < 2:
             continue
 
-        strikes = grp["strike"].values
+        strikes = grp["strike"].values.astype(float)
 
         spot_vals = (grp["spot_used"].values
                      if "spot_used" in grp.columns
@@ -154,99 +181,103 @@ def _apply_spot_signals(result: pd.DataFrame) -> pd.DataFrame:
                      else np.zeros(len(grp)))
         spot = float(np.nanmean(spot_vals))
 
-        open_coi = (grp["session_open_call_oi"].values
-                    if "session_open_call_oi" in grp.columns
+        # ── Greeks and OI at this bar ─────────────────────────
+        def gcol(name):
+            return (pd.to_numeric(grp[name], errors="coerce")
+                      .fillna(0).values
+                    if name in grp.columns
                     else np.zeros(len(grp)))
-        open_poi = (grp["session_open_put_oi"].values
-                    if "session_open_put_oi" in grp.columns
-                    else np.zeros(len(grp)))
 
-        call_demand_vals = (grp["GEX_Call_Demand_$"].values
-                            if "GEX_Call_Demand_$" in grp.columns
-                            else np.zeros(len(grp)))
-        put_demand_vals  = (grp["GEX_Put_Demand_$"].values
-                            if "GEX_Put_Demand_$" in grp.columns
-                            else np.zeros(len(grp)))
+        cg       = gcol("call_gamma")
+        pg       = gcol("put_gamma")
+        open_coi = gcol("session_open_call_oi")
+        open_poi = gcol("session_open_put_oi")
 
-        # ── ATM strike ────────────────────────────────────────
-        atm_idx        = int(np.argmin(np.abs(strikes - spot)))
-        atm_global_idx = grp.index[atm_idx]
+        # ── IV slopes at this bar ─────────────────────────────
+        call_iv_slope = gcol("call_iv_slope5")
+        put_iv_slope  = gcol("put_iv_slope5")
 
-        # ── Nearest call wall above spot ──────────────────────
-        above_mask    = strikes > spot
-        call_oi_above = open_coi.copy()
-        call_oi_above[~above_mask] = 0
+        # ── EWMA demand at this bar ───────────────────────────
+        call_demand_vals = gcol("GEX_Call_Demand_$")
+        put_demand_vals  = gcol("GEX_Put_Demand_$")
 
-        if call_oi_above.max() > 0:
-            call_wall_idx    = int(np.argmax(call_oi_above))
-            call_wall_strike = float(strikes[call_wall_idx])
-            dist_to_call     = max(call_wall_strike - spot, eps)
-        else:
-            dist_to_call     = np.inf
+        # ── Net dealer gamma per strike ───────────────────────
+        net_gamma = cg * open_coi - pg * open_poi
 
-        # ── Nearest put wall below spot ───────────────────────
-        below_mask   = strikes < spot
-        put_oi_below = open_poi.copy()
-        put_oi_below[~below_mask] = 0
+        # ── Find gamma flip strike nearest to spot ────────────
+        # The flip is where net_gamma changes sign.
+        # We look for adjacent strikes that straddle zero and
+        # pick the one closest to spot among all such crossings.
+        flip_idx = None
+        flip_dist = np.inf
 
-        if put_oi_below.max() > 0:
-            put_wall_idx    = int(np.argmax(put_oi_below))
-            put_wall_strike = float(strikes[put_wall_idx])
-            dist_to_put     = max(spot - put_wall_strike, eps)
-        else:
-            dist_to_put     = np.inf
+        for i in range(len(net_gamma) - 1):
+            # Sign change between adjacent strikes
+            if net_gamma[i] * net_gamma[i + 1] <= 0:
+                # Pick the strike of the two that is closer to spot
+                d0 = abs(strikes[i]     - spot)
+                d1 = abs(strikes[i + 1] - spot)
+                candidate_idx  = i if d0 <= d1 else i + 1
+                candidate_dist = min(d0, d1)
+                if candidate_dist < flip_dist:
+                    flip_dist = candidate_dist
+                    flip_idx  = candidate_idx
 
-        # ── Which wall is spot closer to ─────────────────────
-        approach_band = spot * ATM_BAND_APPROACH + eps
+        # Fallback: if no zero cross found use strike with
+        # net_gamma closest to zero near spot
+        if flip_idx is None:
+            near_spot_mask = np.abs(strikes - spot) <= spot * 0.02
+            if near_spot_mask.sum() > 0:
+                near_indices = np.where(near_spot_mask)[0]
+                near_abs_ng  = np.abs(net_gamma[near_spot_mask])
+                flip_idx     = near_indices[int(np.argmin(near_abs_ng))]
+            else:
+                flip_idx = int(np.argmin(np.abs(strikes - spot)))
 
-        closer_to_call = (dist_to_call <= dist_to_put
-                          and dist_to_call < np.inf)
-        closer_to_put  = (dist_to_put  <  dist_to_call
-                          and dist_to_put  < np.inf)
+        flip_strike      = float(strikes[flip_idx])
+        flip_global_idx  = grp.index[flip_idx]
 
-        if not closer_to_call and not closer_to_put:
-            # No wall found on either side — skip
-            continue
+        # ── Proximity weight: spot to flip strike ─────────────
+        prox_band       = spot * PROXIMITY_BAND + eps
+        dist_spot_flip  = abs(spot - flip_strike)
+        proximity_weight = np.exp(-dist_spot_flip / prox_band)
 
-        # ── Demand at ATM ─────────────────────────────────────
-        call_demand_atm = max(float(call_demand_vals[atm_idx]), 0.0)
-        put_demand_atm  = max(float(put_demand_vals[atm_idx]),  0.0)
-        total_demand    = call_demand_atm + put_demand_atm + eps
+        # ── IV trend confirmation at flip strike ──────────────
+        # Rising put IV slope = put demand accumulating = reversal
+        # Rising call IV slope = call demand accumulating = breakout
+        # Clipped to zero — only rising slopes count
+        put_slope_confirm  = max(float(put_iv_slope[flip_idx]),  0.0)
+        call_slope_confirm = max(float(call_iv_slope[flip_idx]), 0.0)
+
+        # ── EWMA demand at flip strike ────────────────────────
+        call_demand_flip = max(float(call_demand_vals[flip_idx]), 0.0)
+        put_demand_flip  = max(float(put_demand_vals[flip_idx]),  0.0)
+
+        # ── Combined signal: demand × IV trend confirmation ───
+        # IV slope confirmation amplifies demand when trend agrees.
+        # When slope is zero the demand signal still contributes
+        # via the +1 base so the signal does not go completely
+        # silent when IV is momentarily flat.
+        reversal_raw = put_demand_flip  * (1.0 + put_slope_confirm)
+        breakout_raw = call_demand_flip * (1.0 + call_slope_confirm)
+
+        total_raw = reversal_raw + breakout_raw + eps
 
         # ── Dominance ratio ───────────────────────────────────
-        # Normalises for overall demand level — isolates direction
-        call_dominance = call_demand_atm / total_demand  # 0 to 1
-        put_dominance  = put_demand_atm  / total_demand  # 0 to 1
-
-        # ── Active wall context ───────────────────────────────
-        if closer_to_call:
-            active_dist   = dist_to_call
-            # Reversal = put demand dominant near call wall
-            # Breakout = call demand dominant near call wall
-            reversal_dom  = put_dominance
-            breakout_dom  = call_dominance
-        else:
-            active_dist   = dist_to_put
-            # Reversal = call demand dominant near put wall
-            # Breakout = put demand dominant near put wall
-            reversal_dom  = call_dominance
-            breakout_dom  = put_dominance
-
-        # ── Wall approach weight ──────────────────────────────
-        approach_weight = np.exp(-active_dist / approach_band)
+        reversal_dom = reversal_raw / total_raw
+        breakout_dom = breakout_raw / total_raw
 
         # ── Net signals — subtract competing side ─────────────
-        # max(..., 0) ensures signal only shows when one side
-        # genuinely dominates. Both drop to zero when balanced.
         net_reversal = max(reversal_dom - breakout_dom, 0.0)
         net_breakout = max(breakout_dom - reversal_dom, 0.0)
 
-        spot_reversal = net_reversal * approach_weight * total_demand
-        spot_breakout = net_breakout * approach_weight * total_demand
+        # ── Final signal weighted by proximity ────────────────
+        spot_reversal = net_reversal * proximity_weight * total_raw
+        spot_breakout = net_breakout * proximity_weight * total_raw
 
-        # ── Assign to ATM row only ────────────────────────────
-        df.loc[atm_global_idx, "GEX_Spot_Reversal_$"] = float(spot_reversal)
-        df.loc[atm_global_idx, "GEX_Spot_Breakout_$"] = float(spot_breakout)
+        # ── Assign to flip strike row only ────────────────────
+        df.loc[flip_global_idx, "GEX_Spot_Reversal_$"] = float(spot_reversal)
+        df.loc[flip_global_idx, "GEX_Spot_Breakout_$"] = float(spot_breakout)
 
     df = df.sort_values(["timestamp", "strike"]).reset_index(drop=True)
     return df
