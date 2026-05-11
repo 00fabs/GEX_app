@@ -9,8 +9,8 @@ FORMULA_COLS = [
     "GEX_Put_Demand_$",
     "GEX_Reversal_$",
     "GEX_Breakout_$",
-    "GEX_Reversal_Near_$",
-    "GEX_Breakout_Near_$",
+    "GEX_Spot_Reversal_$",
+    "GEX_Spot_Breakout_$",
     "GEX_Charm_Pin_$",
     "DEX_Call_OI_$",
     "DEX_Put_OI_$",
@@ -77,16 +77,15 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     call_bid_press = np.clip((call_mid - cbid) / call_spread, 0, 1)
     put_bid_press  = np.clip((put_mid  - pbid) / put_spread,  0, 1)
 
-    # ── Proximity ─────────────────────────────────────────────
-    atm_band_wide  = S * 0.005 + eps
-    atm_band_tight = S * 0.001 + eps
-    proximity_wide  = np.exp(-np.abs(strikes_arr - S) / atm_band_wide)
-    proximity_tight = np.exp(-np.abs(strikes_arr - S) / atm_band_tight)
+    # ── Proximity (wide only — tight replaced by spot signals) 
+    atm_band_wide = S * 0.005 + eps
+    proximity_wide = np.exp(-np.abs(strikes_arr - S) / atm_band_wide)
 
-    # ── Wall magnitude — strictly OI based ───────────────────
+    # ── Wall magnitude ────────────────────────────────────────
     total_open_oi = open_coi + open_poi + eps
     max_open_oi   = total_open_oi.max() + eps
     wall_mag_norm = total_open_oi / max_open_oi
+    wall_mag_safe = wall_mag_norm + eps
 
     # ── Hard wall classification ──────────────────────────────
     call_wall_flag = np.where(open_coi > open_poi * 1.5, 1.0,
@@ -104,8 +103,6 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     out["GEX_Put_Wall_$"] = gex_put_wall / 1e9
 
     # ── GEX_Call_Demand ───────────────────────────────────────
-    # wall_mag_norm anchors to OI-significant strikes only
-    # same formula as the last working version
     gex_call_demand          = np.abs(iv_call_edge * cv
                                       * call_bid_press
                                       * proximity_wide
@@ -123,38 +120,27 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     out["GEX_Put_Demand"]   = gex_put_demand
     out["GEX_Put_Demand_$"] = gex_put_demand / 1e9
 
-    # ── GEX_Reversal (wide — structural) ─────────────────────
-    wall_mag_safe = wall_mag_norm + eps
-    gex_reversal  = np.abs(call_wall_flag * gex_put_demand
-                           + put_wall_flag * gex_call_demand) \
-                    * proximity_wide * wall_mag_safe
+    # ── GEX_Reversal ─────────────────────────────────────────
+    gex_reversal          = np.abs(call_wall_flag * gex_put_demand
+                                   + put_wall_flag * gex_call_demand) \
+                            * proximity_wide * wall_mag_safe
     out["GEX_Reversal"]   = gex_reversal
     out["GEX_Reversal_$"] = gex_reversal / 1e9
 
-    # ── GEX_Breakout (wide — structural) ─────────────────────
-    gex_breakout  = np.abs(call_wall_flag * gex_call_demand
-                           + put_wall_flag * gex_put_demand) \
-                    * proximity_wide * wall_mag_safe
+    # ── GEX_Breakout ─────────────────────────────────────────
+    gex_breakout          = np.abs(call_wall_flag * gex_call_demand
+                                   + put_wall_flag * gex_put_demand) \
+                            * proximity_wide * wall_mag_safe
     out["GEX_Breakout"]   = gex_breakout
     out["GEX_Breakout_$"] = gex_breakout / 1e9
 
-    # ── GEX_Reversal_Near and GEX_Breakout_Near ───────────────
-    # Computed here using raw (pre-EWMA) demand values.
-    # pipeline._apply_ewma() will smooth these after the fact
-    # using the same EWMA_COLS list — add them there too.
-    # Using tight proximity so only fires when spot is within
-    # ~7 points of the strike.
-    gex_reversal_near = np.abs(call_wall_flag * gex_put_demand
-                               + put_wall_flag * gex_call_demand) \
-                        * proximity_tight * wall_mag_safe
-    out["GEX_Reversal_Near"]   = gex_reversal_near
-    out["GEX_Reversal_Near_$"] = gex_reversal_near / 1e9
-
-    gex_breakout_near = np.abs(call_wall_flag * gex_call_demand
-                               + put_wall_flag * gex_put_demand) \
-                        * proximity_tight * wall_mag_safe
-    out["GEX_Breakout_Near"]   = gex_breakout_near
-    out["GEX_Breakout_Near_$"] = gex_breakout_near / 1e9
+    # ── GEX_Spot_Reversal / GEX_Spot_Breakout ────────────────
+    # Placeholders — computed in pipeline._apply_spot_signals()
+    # after EWMA smoothing using cross-strike lookup per timestamp.
+    out["GEX_Spot_Reversal"]   = 0.0
+    out["GEX_Spot_Reversal_$"] = 0.0
+    out["GEX_Spot_Breakout"]   = 0.0
+    out["GEX_Spot_Breakout_$"] = 0.0
 
     # ── GEX_Charm_Pin ─────────────────────────────────────────
     gex_charm_pin          = ((cc * call_bid_press * call_wall_flag
@@ -163,15 +149,13 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     out["GEX_Charm_Pin"]   = gex_charm_pin
     out["GEX_Charm_Pin_$"] = gex_charm_pin / 1e9
 
-    # ── DEX_Call_OI — raw call OI (positive bars) ─────────────
-    dex_call_oi          = open_coi.astype(float)
-    out["DEX_Call_OI"]   = dex_call_oi
-    out["DEX_Call_OI_$"] = dex_call_oi / 1e6
+    # ── DEX_Call_OI ───────────────────────────────────────────
+    out["DEX_Call_OI"]   = open_coi.astype(float)
+    out["DEX_Call_OI_$"] = open_coi.astype(float) / 1e6
 
-    # ── DEX_Put_OI — raw put OI (negative bars) ───────────────
-    dex_put_oi          = -open_poi.astype(float)
-    out["DEX_Put_OI"]   = dex_put_oi
-    out["DEX_Put_OI_$"] = dex_put_oi / 1e6
+    # ── DEX_Put_OI ────────────────────────────────────────────
+    out["DEX_Put_OI"]   = -open_poi.astype(float)
+    out["DEX_Put_OI_$"] = -open_poi.astype(float) / 1e6
 
     # ─────────────────────────────────────────────────────────
     # ADD NEW FORMULAS BELOW THIS LINE
@@ -180,8 +164,7 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     # cbid, cask, pbid, pask,
     # call_iv_z, put_iv_z, iv_call_edge, iv_put_edge,
     # call_bid_press, put_bid_press,
-    # proximity_wide, proximity_tight,
-    # call_wall_flag, put_wall_flag,
+    # proximity_wide, call_wall_flag, put_wall_flag,
     # wall_mag_norm, wall_mag_safe,
     # S, S2, M, eps
     #
