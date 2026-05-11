@@ -101,24 +101,21 @@ def _apply_ewma(result: pd.DataFrame) -> pd.DataFrame:
 
 def _apply_spot_signals(result: pd.DataFrame) -> pd.DataFrame:
     """
-    Computes GEX_Spot_Reversal and GEX_Spot_Breakout using
-    cross-strike lookup per timestamp bar.
+    Computes GEX_Spot_Reversal and GEX_Spot_Breakout per bar.
 
-    At each bar:
-      1. Find nearest call wall above spot (largest call OI above spot)
-      2. Find nearest put wall below spot  (largest put OI below spot)
-      3. Find ATM strike (nearest strike to spot)
-      4. Read EWMA-smoothed call/put demand at ATM strike
-      5. Compute wall approach weights from distance to each wall
-      6. Assign spot signals to ATM strike only
+    Logic per timestamp:
+      1. Find which wall spot is closer to — call wall above
+         or put wall below. Only that wall's context is active.
+      2. Read EWMA-smoothed call and put demand at ATM strike.
+      3. Compute dominance ratio — which demand side is larger.
+      4. Spot_Reversal = opposite-side dominance × approach weight × total demand
+         Spot_Breakout = same-side dominance    × approach weight × total demand
+      5. Subtract competing signal so only the dominant side shows.
+         Both drop to zero when demand is balanced — correct neutral signal.
+      6. Assign result to ATM strike row only. All other strikes zero.
 
-    GEX_Spot_Reversal at ATM:
-      put_demand_ATM  × call_wall_approach_weight  (approaching call wall → put demand = reversal down)
-    + call_demand_ATM × put_wall_approach_weight   (approaching put wall → call demand = reversal up)
-
-    GEX_Spot_Breakout at ATM:
-      call_demand_ATM × call_wall_approach_weight  (approaching call wall → call demand = breakout up)
-    + put_demand_ATM  × put_wall_approach_weight   (approaching put wall → put demand = breakdown)
+    This ensures only one signal can dominate at a time and both
+    cannot be simultaneously large unless demand is genuinely equal.
     """
     df  = result.copy()
     eps = 1e-9
@@ -126,83 +123,128 @@ def _apply_spot_signals(result: pd.DataFrame) -> pd.DataFrame:
     if "timestamp" not in df.columns or "strike" not in df.columns:
         return df
 
-    # Ensure placeholder columns exist
     if "GEX_Spot_Reversal_$" not in df.columns:
         df["GEX_Spot_Reversal_$"] = 0.0
     if "GEX_Spot_Breakout_$" not in df.columns:
         df["GEX_Spot_Breakout_$"] = 0.0
 
+    # Reset both columns to zero before filling
+    df["GEX_Spot_Reversal_$"] = 0.0
+    df["GEX_Spot_Breakout_$"] = 0.0
+
     df = df.sort_values(["timestamp", "strike"]).reset_index(drop=True)
 
-    # ATM band for wall approach weight — 1% of spot
-    # wider than proximity_wide so the signal builds
-    # gradually as spot approaches the wall
+    # Wall approach band — 1% of spot
+    # Signal builds gradually as spot closes in on wall
     ATM_BAND_APPROACH = 0.01
 
-    timestamps = df["timestamp"].unique()
+    for ts in df["timestamp"].unique():
+        mask = df["timestamp"] == ts
+        grp  = df[mask].copy()
 
-    for ts in timestamps:
-        mask      = df["timestamp"] == ts
-        grp       = df[mask].copy()
-        strikes   = grp["strike"].values
-        spot_vals = grp["spot_used"].values if "spot_used" in grp.columns \
-                    else grp["spot"].values
-        spot      = float(np.nanmean(spot_vals))
+        if len(grp) == 0:
+            continue
 
-        open_coi  = grp["session_open_call_oi"].values \
-                    if "session_open_call_oi" in grp.columns \
-                    else np.zeros(len(grp))
-        open_poi  = grp["session_open_put_oi"].values \
-                    if "session_open_put_oi" in grp.columns \
-                    else np.zeros(len(grp))
+        strikes = grp["strike"].values
 
-        call_demand_vals = grp["GEX_Call_Demand_$"].values
-        put_demand_vals  = grp["GEX_Put_Demand_$"].values
+        spot_vals = (grp["spot_used"].values
+                     if "spot_used" in grp.columns
+                     else grp["spot"].values
+                     if "spot" in grp.columns
+                     else np.zeros(len(grp)))
+        spot = float(np.nanmean(spot_vals))
 
-        # ── ATM strike index ──────────────────────────────────
-        atm_idx = int(np.argmin(np.abs(strikes - spot)))
+        open_coi = (grp["session_open_call_oi"].values
+                    if "session_open_call_oi" in grp.columns
+                    else np.zeros(len(grp)))
+        open_poi = (grp["session_open_put_oi"].values
+                    if "session_open_put_oi" in grp.columns
+                    else np.zeros(len(grp)))
+
+        call_demand_vals = (grp["GEX_Call_Demand_$"].values
+                            if "GEX_Call_Demand_$" in grp.columns
+                            else np.zeros(len(grp)))
+        put_demand_vals  = (grp["GEX_Put_Demand_$"].values
+                            if "GEX_Put_Demand_$" in grp.columns
+                            else np.zeros(len(grp)))
+
+        # ── ATM strike ────────────────────────────────────────
+        atm_idx        = int(np.argmin(np.abs(strikes - spot)))
+        atm_global_idx = grp.index[atm_idx]
 
         # ── Nearest call wall above spot ──────────────────────
         above_mask    = strikes > spot
         call_oi_above = open_coi.copy()
         call_oi_above[~above_mask] = 0
+
         if call_oi_above.max() > 0:
             call_wall_idx    = int(np.argmax(call_oi_above))
             call_wall_strike = float(strikes[call_wall_idx])
             dist_to_call     = max(call_wall_strike - spot, eps)
         else:
-            dist_to_call = np.inf
+            dist_to_call     = np.inf
 
         # ── Nearest put wall below spot ───────────────────────
         below_mask   = strikes < spot
         put_oi_below = open_poi.copy()
         put_oi_below[~below_mask] = 0
+
         if put_oi_below.max() > 0:
             put_wall_idx    = int(np.argmax(put_oi_below))
             put_wall_strike = float(strikes[put_wall_idx])
             dist_to_put     = max(spot - put_wall_strike, eps)
         else:
-            dist_to_put = np.inf
+            dist_to_put     = np.inf
 
-        # ── Wall approach weights ─────────────────────────────
-        approach_band        = spot * ATM_BAND_APPROACH + eps
-        call_approach_weight = np.exp(-dist_to_call / approach_band)
-        put_approach_weight  = np.exp(-dist_to_put  / approach_band)
+        # ── Which wall is spot closer to ─────────────────────
+        approach_band = spot * ATM_BAND_APPROACH + eps
+
+        closer_to_call = (dist_to_call <= dist_to_put
+                          and dist_to_call < np.inf)
+        closer_to_put  = (dist_to_put  <  dist_to_call
+                          and dist_to_put  < np.inf)
+
+        if not closer_to_call and not closer_to_put:
+            # No wall found on either side — skip
+            continue
 
         # ── Demand at ATM ─────────────────────────────────────
-        call_demand_atm = float(call_demand_vals[atm_idx])
-        put_demand_atm  = float(put_demand_vals[atm_idx])
+        call_demand_atm = max(float(call_demand_vals[atm_idx]), 0.0)
+        put_demand_atm  = max(float(put_demand_vals[atm_idx]),  0.0)
+        total_demand    = call_demand_atm + put_demand_atm + eps
 
-        # ── Spot signals ──────────────────────────────────────
-        spot_reversal = (put_demand_atm  * call_approach_weight
-                         + call_demand_atm * put_approach_weight)
+        # ── Dominance ratio ───────────────────────────────────
+        # Normalises for overall demand level — isolates direction
+        call_dominance = call_demand_atm / total_demand  # 0 to 1
+        put_dominance  = put_demand_atm  / total_demand  # 0 to 1
 
-        spot_breakout = (call_demand_atm * call_approach_weight
-                         + put_demand_atm  * put_approach_weight)
+        # ── Active wall context ───────────────────────────────
+        if closer_to_call:
+            active_dist   = dist_to_call
+            # Reversal = put demand dominant near call wall
+            # Breakout = call demand dominant near call wall
+            reversal_dom  = put_dominance
+            breakout_dom  = call_dominance
+        else:
+            active_dist   = dist_to_put
+            # Reversal = call demand dominant near put wall
+            # Breakout = put demand dominant near put wall
+            reversal_dom  = call_dominance
+            breakout_dom  = put_dominance
+
+        # ── Wall approach weight ──────────────────────────────
+        approach_weight = np.exp(-active_dist / approach_band)
+
+        # ── Net signals — subtract competing side ─────────────
+        # max(..., 0) ensures signal only shows when one side
+        # genuinely dominates. Both drop to zero when balanced.
+        net_reversal = max(reversal_dom - breakout_dom, 0.0)
+        net_breakout = max(breakout_dom - reversal_dom, 0.0)
+
+        spot_reversal = net_reversal * approach_weight * total_demand
+        spot_breakout = net_breakout * approach_weight * total_demand
 
         # ── Assign to ATM row only ────────────────────────────
-        # All other strikes at this timestamp stay zero
-        atm_global_idx = grp.index[atm_idx]
         df.loc[atm_global_idx, "GEX_Spot_Reversal_$"] = float(spot_reversal)
         df.loc[atm_global_idx, "GEX_Spot_Breakout_$"] = float(spot_breakout)
 
