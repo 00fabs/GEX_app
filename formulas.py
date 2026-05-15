@@ -34,20 +34,21 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
                                  errors="coerce").fillna(0).values
         return np.zeros(len(out))
 
-    cg    = col("call_gamma")
-    pg    = col("put_gamma")
-    cv    = col("call_vanna")
-    pv    = col("put_vanna")
-    cc    = col("call_charm")
-    pc    = col("put_charm")
-    cd    = col("call_delta")
-    pd_   = col("put_delta")
-    civ   = col("call_iv")
-    piv   = col("put_iv")
-    cbid  = col("call_bid")
-    cask  = col("call_ask")
-    pbid  = col("put_bid")
-    pask  = col("put_ask")
+    cg  = col("call_gamma")
+    pg  = col("put_gamma")
+    cv  = col("call_vanna")
+    pv  = col("put_vanna")
+    cc  = col("call_charm")
+    pc  = col("put_charm")
+    cd  = col("call_delta")
+    pd_ = col("put_delta")
+    civ = col("call_iv")
+    piv = col("put_iv")
+
+    cbid = col("call_bid")
+    cask = col("call_ask")
+    pbid = col("put_bid")
+    pask = col("put_ask")
 
     civ_mean = col("call_iv_mean20")
     civ_std  = col("call_iv_std20")
@@ -60,17 +61,19 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     S           = out["spot_used"].values.astype(float)
     S2          = S ** 2
     M           = SPX_MULT
-    strikes_arr = col("strike") if "strike" in out.columns \
-                  else np.zeros(len(out))
+    strikes_arr = (col("strike") if "strike" in out.columns
+                   else np.zeros(len(out)))
 
-    # ── IV Z-score and relative edge ─────────────────────────
+    # ── IV z-score edge ───────────────────────────────────────
     call_iv_z    = (civ - civ_mean) / (civ_std + eps)
     put_iv_z     = (piv - piv_mean) / (piv_std  + eps)
     EDGE_THRESH  = 0.5
-    iv_call_edge = np.clip(call_iv_z - put_iv_z - EDGE_THRESH, 0, None)
-    iv_put_edge  = np.clip(put_iv_z  - call_iv_z - EDGE_THRESH, 0, None)
+    iv_call_edge = np.clip(call_iv_z - put_iv_z - EDGE_THRESH,
+                           0, None)
+    iv_put_edge  = np.clip(put_iv_z  - call_iv_z - EDGE_THRESH,
+                           0, None)
 
-    # ── Bid pressure ─────────────────────────────────────────
+    # ── Bid pressure ──────────────────────────────────────────
     call_mid       = (cbid + cask) / 2.0
     put_mid        = (pbid + pask) / 2.0
     call_spread    = np.abs(cask - cbid) + eps
@@ -88,7 +91,7 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     wall_mag_norm = total_open_oi / max_open_oi
     wall_mag_safe = wall_mag_norm + eps
 
-    # ── Hard wall classification ──────────────────────────────
+    # ── Wall classification ───────────────────────────────────
     call_wall_flag = np.where(open_coi > open_poi * 1.5, 1.0,
                      np.where(open_poi > open_coi * 1.5, 0.0, 0.5))
     put_wall_flag  = 1.0 - call_wall_flag
@@ -104,47 +107,47 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     out["GEX_Put_Wall_$"] = gex_put_wall / 1e9
 
     # ── GEX_Call_Demand ───────────────────────────────────────
-    gex_call_demand          = np.abs(iv_call_edge * cv
-                                      * call_bid_press
-                                      * proximity
-                                      * wall_mag_norm
-                                      * M * S2)
+    gex_call_demand = np.abs(
+        iv_call_edge * cv * call_bid_press
+        * proximity * wall_mag_norm * M * S2)
     out["GEX_Call_Demand"]   = gex_call_demand
     out["GEX_Call_Demand_$"] = gex_call_demand / 1e9
 
     # ── GEX_Put_Demand ────────────────────────────────────────
-    gex_put_demand          = np.abs(iv_put_edge * pv
-                                     * put_bid_press
-                                     * proximity
-                                     * wall_mag_norm
-                                     * M * S2)
+    gex_put_demand = np.abs(
+        iv_put_edge * pv * put_bid_press
+        * proximity * wall_mag_norm * M * S2)
     out["GEX_Put_Demand"]   = gex_put_demand
     out["GEX_Put_Demand_$"] = gex_put_demand / 1e9
 
     # ── GEX_Reversal ─────────────────────────────────────────
-    gex_reversal          = np.abs(call_wall_flag * gex_put_demand
-                                   + put_wall_flag * gex_call_demand) \
-                            * proximity * wall_mag_safe
+    gex_reversal = (
+        np.abs(call_wall_flag * gex_put_demand
+               + put_wall_flag * gex_call_demand)
+        * proximity * wall_mag_safe)
     out["GEX_Reversal"]   = gex_reversal
     out["GEX_Reversal_$"] = gex_reversal / 1e9
 
     # ── GEX_Breakout ─────────────────────────────────────────
-    gex_breakout          = np.abs(call_wall_flag * gex_call_demand
-                                   + put_wall_flag * gex_put_demand) \
-                            * proximity * wall_mag_safe
+    gex_breakout = (
+        np.abs(call_wall_flag * gex_call_demand
+               + put_wall_flag * gex_put_demand)
+        * proximity * wall_mag_safe)
     out["GEX_Breakout"]   = gex_breakout
     out["GEX_Breakout_$"] = gex_breakout / 1e9
 
     # ── GEX_Charm_Pin ─────────────────────────────────────────
-    gex_charm_pin          = ((cc * call_bid_press * call_wall_flag
-                               - pc * put_bid_press * put_wall_flag)
-                              * wall_mag_norm * proximity * M * S2)
+    gex_charm_pin = (
+        (cc * call_bid_press * call_wall_flag
+         - pc * put_bid_press * put_wall_flag)
+        * wall_mag_norm * proximity * M * S2)
     out["GEX_Charm_Pin"]   = gex_charm_pin
     out["GEX_Charm_Pin_$"] = gex_charm_pin / 1e9
 
-    # ── GEX_Entry_Signal placeholder ─────────────────────────
-    # Computed in pipeline._apply_entry_signal() after
-    # cumulative demand is built from session open.
+    # ── GEX_Entry_Signal — placeholder filled by pipeline ─────
+    # _apply_entry_signal() reads the internal columns below
+    # and writes back to GEX_Entry_Signal_$ after cumulative
+    # demand is built.
     out["GEX_Entry_Signal"]   = 0.0
     out["GEX_Entry_Signal_$"] = 0.0
 
@@ -156,10 +159,31 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
     out["DEX_Put_OI"]   = -open_poi.astype(float)
     out["DEX_Put_OI_$"] = -open_poi.astype(float) / 1e6
 
-    # ── Internal columns for pipeline entry signal ────────────
-    # Delta acceleration: how far each side is from ATM
-    # Used by _apply_entry_signal to filter entry strikes
-    out["_call_delta_acc"] = np.abs(cd - 0.5)
+    # ── Internal columns consumed by pipeline ─────────────────
+    # _charm_reversal_score: used to find the entry strike for
+    # reversal setups. Measures where charm is most aggressively
+    # pulling delta at strikes between spot and wall.
+    # For a put wall (reversal from above): negative put charm
+    # means dealers are unwinding put delta fastest — this is
+    # where price friction concentrates. We take the absolute
+    # value weighted by put demand and proximity.
+    charm_reversal_score = (
+        np.abs(pc) * gex_put_demand * proximity * wall_mag_norm)
+    out["_charm_reversal_score"] = charm_reversal_score
+
+    # _gamma_breakout_score: used to find entry strike for
+    # breakout setups. High gamma × call demand × proximity
+    # identifies where dealer hedging flips and momentum fires.
+    gamma_breakout_score = (
+        cg * gex_call_demand * proximity * wall_mag_norm)
+    out["_gamma_breakout_score"] = gamma_breakout_score
+
+    # _spot_velocity: rate of spot movement per bar, computed
+    # per strike group. Pipeline writes this after sorting by
+    # timestamp — placeholder zero here, pipeline fills it.
+    out["_spot_velocity"] = 0.0
+
+    out["_call_delta_acc"] = np.abs(cd  - 0.5)
     out["_put_delta_acc"]  = np.abs(pd_ + 0.5)
     out["_gamma_press"]    = cg * open_coi + pg * open_poi
     out["_call_wall_flag"] = call_wall_flag
@@ -169,20 +193,24 @@ def apply_formulas(df: pd.DataFrame, spot_override: float,
 
     # ─────────────────────────────────────────────────────────
     # ADD NEW FORMULAS BELOW THIS LINE
-    # Available arrays: cg, pg, cv, pv, cc, pc, cd, pd_,
-    # civ, piv, open_coi, open_poi,
-    # cbid, cask, pbid, pask,
-    # call_iv_z, put_iv_z, iv_call_edge, iv_put_edge,
-    # call_bid_press, put_bid_press, proximity,
-    # call_wall_flag, put_wall_flag,
-    # wall_mag_norm, wall_mag_safe,
-    # S, S2, M, eps
+    # Available arrays:
+    #   cg, pg, cv, pv, cc, pc, cd, pd_
+    #   civ, piv, open_coi, open_poi
+    #   cbid, cask, pbid, pask
+    #   call_iv_z, put_iv_z, iv_call_edge, iv_put_edge
+    #   call_bid_press, put_bid_press
+    #   proximity, call_wall_flag, put_wall_flag
+    #   wall_mag_norm, wall_mag_safe
+    #   gex_call_demand, gex_put_demand
+    #   gex_reversal, gex_breakout
+    #   charm_reversal_score, gamma_breakout_score
+    #   S, S2, M, eps
     #
     # Template:
     #   arr = <numpy expression>
     #   out["GEX_MY_FORMULA"]   = arr
     #   out["GEX_MY_FORMULA_$"] = arr / 1e9
-    #   Add "GEX_MY_FORMULA_$" to FORMULA_COLS at top.
+    #   Add "GEX_MY_FORMULA_$" to FORMULA_COLS at the top.
     # ─────────────────────────────────────────────────────────
 
     return out
